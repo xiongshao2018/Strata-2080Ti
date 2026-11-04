@@ -1,4 +1,7 @@
 // src/core/nv_defaults.cpp - see include/strata/core/nv_defaults.hpp.
+//
+// This fork runs sm_75 only (two RTX 2080 Ti).  The sm_86 and sm_60 tables below are not reachable on it and are kept
+// only because the file is shared with upstream; nv_default_env answers empty for every card that is not one of them.
 #include "strata/core/nv_defaults.hpp"
 
 #include "strata/core/emulate.hpp"

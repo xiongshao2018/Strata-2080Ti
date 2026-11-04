@@ -9,7 +9,7 @@
 
 <h3 align="center">Run a state-of-the-art model on your own gaming PC</h3>
 
-<p align="center">Support for NVIDIA, AMD, Intel · Windows, Linux, Mac · free and open source</p>
+<p align="center">This fork: two NVIDIA RTX 2080 Ti over NVLink · Linux · free and open source</p>
 
 <p align="center">
   <a href="https://github.com/Niko1221/Strata/releases"><img src="https://img.shields.io/github/v/release/Niko1221/Strata?include_prereleases&label=release" alt="Latest release"></a>
@@ -45,12 +45,7 @@ memory. More memory gives a bigger model or a faster one.
 
 | Your computer | Details |
 | --- | --- |
-| **NVIDIA** GeForce RTX 20, 30, 40, 50 series (12 GB or more) | Install the app or the Terminal. |
-| **AMD** Radeon RX 6800 and newer, Radeon AI PRO R9700 (12 GB or more) | [AMD cards](docs/AMD_HIP.md) |
-| **Intel** Arc | [Intel Arc](docs/INTEL_ARC.md), [Intel engine](docs/INTEL.md) |
-| **Apple Silicon Mac** (M1 or newer, macOS 15 or newer) | [Mac](docs/MAC.md) |
-| **AMD Ryzen AI Max (Strix Halo)** and other unified-memory systems | [Strix Halo](docs/STRIX_HALO.md) |
-| Older cards and processors | [Older GPUs](docs/OLDER_GPUS.md), [Older CPUs](docs/INSTALL.md#older-cpus-experimental) |
+| **Two NVIDIA RTX 2080 Ti** (11 GB each, compute capability 7.5) joined by an **NVLink bridge** | The only supported configuration. The engine is compiled for sm_75 only and the layer split hands its rows over NVLink ([multi-GPU](docs/MULTI_GPU.md)). |
 
 Also needed:
 
@@ -58,8 +53,9 @@ Also needed:
 - Windows 10 / 11, Linux or macOS
 - a current graphics driver
 
-Two or three cards of the same make can share a model ([multi-GPU](docs/MULTI_GPU.md)). Strata never splits a model across
-NVIDIA and AMD cards. Full list: [docs/INSTALL.md](docs/INSTALL.md#what-you-need).
+This fork has no AMD (HIP), Intel (SYCL), Apple Metal or other NVIDIA compute capability path: those were removed, not
+merely switched off. `nvidia-smi topo -p2p n` must report `OK` between the two cards, or the layer split refuses the
+NVLink hand-off and says so.
 
 ## Install
 

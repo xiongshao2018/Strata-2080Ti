@@ -1,27 +1,94 @@
-# Strata on two or more GPUs (layer split)
+# Strata on two RTX 2080 Ti (layer split over NVLink)
 
-One model can run across several NVIDIA cards in one PC. The layers are split into contiguous ranges, one per GPU:
-the first card runs layers 0 to K-1, the next card runs K onward, and so on; the last card also runs the output head
-and the draft (MTP) layer. Each card keeps an expert cache for **its own layers only**, so two cards hold about twice
-the experts one card holds - for the Coder model on a 16 GB + 24 GB pair, nearly all of them, which is where the
-speed comes from (decode then barely touches the CPU pool).
+This fork is built for one hardware pair: **two NVIDIA RTX 2080 Ti cards joined by an NVLink bridge**, on one PC. The
+engine is compiled for sm_75 only, and the AMD (HIP) and Intel (SYCL) backends, the Apple Metal engine and every other
+compute capability are not part of it.
 
-This is pipeline (layer) parallelism, not tensor parallelism: a token crosses from one card to the next once per
-verify window (a few hundred KB through pinned RAM), not twice per layer. No NVLink or peer-to-peer access is
-needed; cards on x4 or x1 slots work, and the PCIe share of each card is probed on its own link. A `--pcie-frac` you give
-is every card's share and skips those probes; there is no per-card setting yet.
+One model runs across the two cards. The layers are split into two contiguous ranges: the first card runs layers 0 to
+K-1, the second card runs K onward and also holds the output head and the draft (MTP) layer. Each card keeps an expert
+cache for **its own layers only**, so the pair holds about twice the experts one card holds, which is where the speed
+comes from (decode then barely touches the CPU pool).
 
-**Two models on two cards (the app).** A layer split puts one model on several cards. The other way to use two cards is two
-models, one per card, each answering on its own. In the app, turn on **Run multiple models** on the Models page: the card
-list then says which card a loaded model uses ("In use by ..."), starts that card as Off for the next model, and
-explains a failed start on a card that is taken. Measured on a PC with Radeon AI PRO R9700 cards (two of four, Linux): Q2_0 on
-one card and IQ3_XXS on another both loaded (33 s and 59 s with the files cached, 114 s the first time), both answered chats
-(about 60 tokens/s each), the Monitor listed both, and unloading one left the other answering. This was run with the AMD build only;
-the same app code drives NVIDIA cards, but we have not run two models on two NVIDIA cards.
+This is pipeline (layer) parallelism, not tensor parallelism: a token crosses from one card to the other once per
+verify window (a few hundred KB), not twice per layer. In this fork the crossing is a direct GPU-to-GPU copy over the
+NVLink bridge (`cudaMemcpyPeerAsync` after `cudaDeviceEnablePeerAccess`), **not** the upstream path through pinned host
+memory: the hand-off buffer lives in the receiving card's VRAM and the rows never touch RAM. Peer access is checked
+once at start (`cudaDeviceCanAccessPeer` both ways, then a test copy each way); a pair that cannot reach each other
+does not silently fall back to RAM - the layer split says so and uses the mapped route only when `--split-device 0`
+puts both stages on one card.
 
-**One make of card per engine.** An engine drives one make of card (NVIDIA, AMD or Intel). The app, `strata launch` and setup
-offer only the cards the engine can drive, never split a model across two makes, say in one plain line when the other make has
-the bigger card, and say that two models at once on two makes is not supported.
+`nvidia-smi topo -m` should show `NV2` between the two cards and `nvidia-smi topo -p2p n` should say `OK` both ways.
+The cards' PCIe share is still probed on each link (a `--pcie-frac` you give is every card's share); the NVLink bridge
+is what carries the layer hand-off, not the PCIe slots.
+
+**Measured settings for this pair (2026-11-04, IQ3_S + MTP `--spec 4`, 262144-token context, INT8 KV).** The decode
+rate on this fork is dominated by expert-cache misses, so the adaptive tier must stay on (it is the default): with it
+off the hit rate sat at 40% and decode was 51 tok/s; with it on the rate settled at 96-98%.
+
+**Where the split goes is the single biggest knob, and it is not where the first pass put it.** A split of 40/8 keeps
+only 11154 expert slots and leaves the second card idle for most of the window: stage 0 waited 18.7 ms per window
+against the pool while stage 1 waited 0. Stage 0 is the critical path, so a smaller share on it wins even though the
+second card's expert tier is slower to fill. Sweeping the split point on 400-token runs (median of 3-5, same
+configuration otherwise):
+
+| `--layer-split` | decode tok/s | expert slots |
+|---|---|---|
+| 28 | 67.3 | 15262 |
+| 30 | 68.1-71.2 (noisy) | 15190 |
+| **32** | **69.5-70.0 (most stable)** | **15105** |
+| 34 | 66.7 | 14800 |
+| 36 | 64.2 | 13514 |
+| 40 | 62.9-66.6 | 11154 |
+
+32 is the choice: it gives up ~1 tok/s of best-case peak against 30 in exchange for a 5665-5804 ms spread over five
+runs instead of 5503-6148 ms. The two stages then measure 14.9 ms and 7.8 ms per window (wait for the GPU) - still
+unequal, which is the second card's x1 link, but no longer 2.4:1.
+
+`--batch-groups 2` pipelining the two stages was worth another ~15% over the serial loop (49-52 -> 58-63 tok/s on
+512-token runs). `--pipeline-windows 2` is *slower* here even at split 32 (66.8 vs 69.9 tok/s): the second verifier's
+arena and graphs cost more VRAM than the overlap returns, and the expert cache shrinks to 14865 slots. It stays off.
+`STRATA_SPLIT_OVERLAP=1` now works over NVLink too (the publish kernel stores into the peer card's VRAM directly);
+its output is token-for-token identical to the serial loop, but it measured level here (69.7 vs 69.9), so it is left
+off as well.
+
+**Two CPU-side knobs are worth ~6% together.** The pool is on the critical path of every window's doorbell, and the
+default worker count is one short of this 24-core/32-thread CPU:
+
+| setting | tok/s |
+|---|---|
+| defaults (`pool_workers=15`) | 62.9 |
+| `--pool-workers 24 --aux-cpus auto` | 66.6 |
+| `--pool-workers 24 --aux-cpus auto`, split 32 | 69.9 |
+| `--pool-workers 32` | 50.1 (oversubscribed) |
+
+`--aux-cpus auto` keeps the adaptive tier's job thread and the CUDA driver's threads off the pool workers' cores.
+`--pool-workers 24` occupies every physical core, so leave it off if the same machine is doing other work.
+
+**Speculation depth.** `--spec 4` with `--spec-min-p 0.6` measured 71.6 tok/s against 69.4 at the old 0.5 default
+(median of 4). The draft is accepted 80%/67%/67% at depths 1-3, so cutting the tail below 0.6 is nearly free; 0.75
+and 0.85 fell to 69.1 and 63.8 because they also drop the depth-2 drafts that do land. `--spec 3` and `--spec 6`-`8`
+were 68.2 and 60.6-55.9.
+
+Keep `--vram-reserve-mib 1500` as measured: taking it down to 900 for more slots did not help. Note the hardware
+caveat below.
+
+**The prompt planner used to be told the wrong link.** `probe_pcie_h2d_gbps` keeps the fastest of its four bursts, but
+the *variable* the prompt planner reads was overwritten by each probe in turn; on a layer split the stages are probed
+in order, so the last reading - the second card's x1 link at 0.8 GB/s - set the plan for a prompt path that runs on
+the first card's x16. The plan line read `PCIe 0.8 GB/s` and chunked the prompt against it. It now keeps the fastest
+reading (`g_last_h2d_gbps = std::max(...)`) and reports `PCIe 12.4 GB/s`.
+
+**The second card's PCIe link matters.** This machine's second 2080 Ti sits behind a chipset root port that
+negotiates **x1 Gen2** (`/sys/bus/pci/devices/0000:05:00.0/current_link_width` = 1, while the first card is x16
+Gen3). NVLink carries the layer hand-off, so the split itself is fine, but every expert the second card has to
+pull from RAM crosses that 0.25 GB/s link, which is why fewer layers on that card measured faster. Moving the card
+to a CPU-attached x16 slot (or the second PEG slot) is worth more than any flag in this file.
+
+**Two models on two cards (the app).** A layer split puts one model on both cards. The other way to use them is two models,
+one per card, each answering on its own. In the app, turn on **Run multiple models** on the Models page: the card list then
+says which card a loaded model uses ("In use by ..."), starts that card as Off for the next model, and explains a failed
+start on a card that is taken. Both cards must be 2080 Ti here: this fork drives NVIDIA cards only, so a Radeon or an Intel
+card in the same PC is listed and left alone rather than used.
 
 ## Using it
 
