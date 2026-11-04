@@ -72,6 +72,17 @@ were 68.2 and 60.6-55.9.
 Keep `--vram-reserve-mib 1500` as measured: taking it down to 900 for more slots did not help. Note the hardware
 caveat below.
 
+**The later card's reserve: 2100 MiB, and more slots is not faster.** `--vram-reserve-later-mib` sets what CUDA1
+keeps free; the layer split sizes its cache from `free - reserve` alone, so lowering it is the only way to add
+experts on the second card. Measured with the production config (`--expert-cache 8000`, split 32, 400 tokens, 4-5
+runs each): 2200 gave 15105 slots in total and 71.6 tok/s, 1950 gave 15225 and 70.1, 1900 gave 15250 and 70.3,
+1800 gave 15299 and 68.3, 1500 gave 15443 and 69.5. The extra 145-338 slots are 0.9-2.2% of the 24576-pair
+profile and the measured speed does not follow them, so pick the reserve for the VRAM you must keep free, not for
+slots. 2100 leaves 1693 MiB free on CUDA1 once everything is loaded and **1600 MiB after an 8192-token prompt**
+(2200 left 1798 and 1734, 1950 fell to 1450 after a 4096-token prompt), which keeps the 1.5 GiB the display stack
+needs with room to spare. The prompt path borrows slots from both caches, so check a long prompt after changing
+this: 8192 tokens measured 536 tok/s at 1900 against 523 at 2200.
+
 **The prompt planner used to be told the wrong link.** `probe_pcie_h2d_gbps` keeps the fastest of its four bursts, but
 the *variable* the prompt planner reads was overwritten by each probe in turn; on a layer split the stages are probed
 in order, so the last reading - the second card's x1 link at 0.8 GB/s - set the plan for a prompt path that runs on
