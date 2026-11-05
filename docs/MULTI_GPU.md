@@ -482,6 +482,75 @@ a card was freed is left out); b/a 5836 and 6432 (timed on the rig), against 102
 
 ## Measured
 
+### This pair, 2026-11-05: the production configuration and what it cost to find it
+
+The settings below are the ones this machine runs. They were chosen by A/B on a clean restart per arm (cold
+prompts, a unique nonce in the first tokens so the prompt cache cannot answer), 2 runs per size, 64 generated
+tokens, TTFT read from the stream's first delta and the engine's own `prompt N tokens = 0 reused + N read in M ms`
+line as the cross-check. Hardware is the Gen3 x16 first card and the Gen2 x1 second card this file describes.
+
+| arm | 1048 tok TTFT | 7894 tok | 15706 tok | 62620 tok |
+|---|---|---|---|---|
+| production before (INT8 KV) | 6720 ms | 15691 ms | 24109 ms | — |
+| + `--conversation-cache-slots 3 --conversation-cache-park-gain 1024 --adapt-min-gain 2.0` | 6728 | 15693 | 24138 | 69866 |
+| **+ `--kv k8v4`** | **6365** | 15804 | **23928** | **68366** |
+| + `STRATA_PCIE_FRAC_DEFAULT=old STRATA_SPLIT_OWN_BUFFERS=1` | 6376 | 15808 | 23626 | — |
+| + `--pipeline-windows 1` | 6631 | 16026 | 24349 | — |
+| + `STRATA_CKPT_THREADS=1 STRATA_CKPT_POOL=1` | 6719 | — | 23832 | 70023 |
+
+**`--kv k8v4` is the one change that paid.** The hybrid cell is 816 B against INT8's 1,056, and the VRAM it
+returns goes straight into the expert caches: CUDA0 7310 -> 7566 slots, CUDA1 7217 -> 7336. Short-prompt TTFT
+fell 5.2%; the long end is unchanged (the prompt path there is bandwidth-bound on the first card's x16, not on
+the KV bytes). Decode stayed 80 tok/s at 8192 and 72 tok/s at 32K.
+
+**Three settings that look useful and are not, measured rather than argued:**
+
+- `STRATA_PCIE_FRAC_DEFAULT=old` is a **no-op on CUDA**. The variable only reaches `pcie_frac_auto`, which this
+  build leaves false outside HIP gfx12; the log reads `pcie_frac 0.34` / `CUDA1 ... 0.02` with and without it.
+- `STRATA_SPLIT_OWN_BUFFERS=1` is a **no-op too**: it is already the default (`v == nullptr || v[0] != '0'`), and
+  the second card has 1.6 GiB free, short of the `bytes_needed + 1.5 GiB` gate, so no stage ever keeps its own
+  prompt buffers and the log never prints that line. The prompt path still borrows ~3500 slots per request.
+- `--pipeline-windows 1` was worse at every size (6631 / 16026 / 24349) and takes 160 MiB out of CUDA0's cache.
+  It stays at `0`.
+
+`STRATA_CKPT_THREADS=1 STRATA_CKPT_POOL=1` (a layer split saving both stages' checkpoint parts at once, out of
+recycled vectors) also lost: 32K went 68966 -> 70023 ms. A 32K prompt takes 8 checkpoints, and the parallel save
+does not make up for the pooled vectors' page faults on a machine whose page cache is already holding 25 GiB of
+experts.
+
+The configuration this machine runs, with the generated arguments it must keep:
+
+```
+--layer-split 32 --expert-cache 8000
+--vram-reserve-mib 1500 --vram-reserve-later-mib 2100
+--kv k8v4 --pipeline-windows 0
+--adapt-async 1 --adapt-min-gain 2.0
+--conversation-cache-slots 3 --conversation-cache-park-gain 1024
+--pool-workers 24 --aux-cpus auto
+--spec 4 --spec-min-p 0.6
+--resident-experts --trim-stage-weights --batch-groups 2
+```
+
+`--conversation-cache-slots 3` and `--adapt-min-gain 2.0` do not move TTFT; they keep 8192-token decode steady
+across repeated cold reads (arm 0 fell to 39.9 tok/s on its first 8192 run, the arm with them held 82-85 on
+both). `--conversation-cache-park-gain 1024` stops a turn that grew by a few hundred tokens from parking a
+whole snapshot the next turn drops.
+
+**Where the remaining TTFT goes.** The batched prompt read itself is the cost, and it is not linear: `STRATA_TRACE`
+times the same code path at **5497 ms for 1043 tokens (5.27 ms/token)** against **15662 ms for 7894 (2.0 ms/token)**
+and 68367 ms for 62620 (1.09 ms/token). A fit over the four sizes gives 7.1 s + 0.99 ms/token, so roughly 5-9 s of
+the request is spent before the marginal rate applies, and it grows with the prompt rather than staying fixed.
+
+Two things are visible in the same trace and are the likely constituents. Every request logs
+`capturing the N-token window` for both stages, because `--adapt-async 1` keeps marking experts out of VRAM, so
+`refresh_ar()` cannot settle on the all-resident graph and the two variants (`exec_` / `exec_nr_`) keep flipping.
+And the prompt path borrows ~3500 cache slots per request and refills them afterwards; the trace's admission line
+carries the split between the read, the windows and the refill. Turning the async tier off is not an option (hit
+rate 40%, decode 51 tok/s), so this is a fork-level fix - keep both captured graphs alive across an `ar_off_` flip
+instead of re-capturing, and park the borrowed slots in RAM so the refill is a copy rather than a re-read - not a
+flag. `--short-read` already routes the last 64 tokens through the windows; raising it moves more of a short
+prompt onto the window path, which is worth measuring before trusting it.
+
 The Coder on an RTX 5080 + RTX 3090 (Ryzen 9 9950X3D), 32K context; details in
 `bench/results/2026-09-29-layer-split/`:
 
