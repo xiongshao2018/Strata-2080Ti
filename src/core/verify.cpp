@@ -1435,11 +1435,22 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     const int64_t HB = Verifier::handoff_floats(g);
     if (lb_ > 0) {
         const float* hin = hand_in_ + (size_t) hrow0 * HB;   // the group's rows: [R][bo][inj] contiguous
-        // the overlapped split: this graph was launched before the previous stage finished - wait for its hand-off
+        // the overlapped split: this graph was launched before the previous stage finished - wait for its hand-off.
+        // This wait stays for BOTH hand-off memories: the NVLink copy below reads the previous stage's VRAM, which the
+        // pipeline reaches before that stage's window has written it.
         if (hflag_in_d_ != nullptr && !batch_rec_) wait_handoff(hflag_in_d_, 1u, herr_d_, g_split_wait_ns, cs);
-        copy_from_mapped(R_, hin, (int64_t) T * HC * N, cs);
-        copy_from_mapped(bo_, hin + (size_t) T * HC * N, (int64_t) T * N, cs);
-        copy_from_mapped(inj2_, hin + (size_t) T * (HC + 1) * N, (int64_t) T * HC, cs);
+        if (hand_peer_dev_ >= 0) {   // NVLink: the rows are the previous stage's VRAM, copied straight across
+            // A kernel, not cudaMemcpyPeerAsync: peer access makes the other card's VRAM plainly addressable, and a
+            // copy kernel is capturable (cudaMemcpyPeerAsync is refused inside a capture) and keeps the window's
+            // kernel-to-kernel chain.
+            copy_peer(R_, hin, (int64_t) T * HC * N, cs);
+            copy_peer(bo_, hin + (size_t) T * HC * N, (int64_t) T * N, cs);
+            copy_peer(inj2_, hin + (size_t) T * (HC + 1) * N, (int64_t) T * HC, cs);
+        } else {
+            copy_from_mapped(R_, hin, (int64_t) T * HC * N, cs);
+            copy_from_mapped(bo_, hin + (size_t) T * HC * N, (int64_t) T * N, cs);
+            copy_from_mapped(inj2_, hin + (size_t) T * (HC + 1) * N, (int64_t) T * HC, cs);
+        }
     } else if (const NativeEmbed* ne = native_embed()) {       // plan v0.3 P6: the GGUF-form table
         ne->gather_dev(tok_, T, emb_, cs);
         broadcast_streams(emb_, R_, N, (int) HC, T, cs);
@@ -2513,9 +2524,19 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }
     if (le_ < g.n_layers) {   // a layer split's earlier stage: hand the residual on, no head
         float* hout = hand_out_ + (size_t) hrow0 * HB;
+        // The overlapped split's protocol stays for BOTH hand-off memories: the payload lands in `hout` (mapped host
+        // memory, or the next stage's VRAM over NVLink) and the flag it raises is still the host word the next stage
+        // waits on.  Skipping the publish for the NVLink case would leave that flag down and stall the pipeline.
         if (hflag_out_d_ != nullptr && !batch_rec_) {   // the overlapped split: payload + the next stage's flag
             handoff_publish(hout, R_, (int64_t) T * HC * N, bo_, (int64_t) T * N, inj2_, (int64_t) T * HC, hcount_d_,
                             hflag_out_d_, cs, g_test_drop > 0 ? hdrop_d_ : nullptr);   // the test word only with the hook on
+            return true;
+        }
+        if (hand_peer_dev_ >= 0) {   // NVLink, serial loop: one copy kernel per piece straight into the next stage's VRAM
+            // (a kernel, not cudaMemcpyPeerAsync: the latter is refused inside a stream capture - see copy_peer)
+            copy_peer(hout, R_, (int64_t) T * HC * N, cs);
+            copy_peer(hout + (size_t) T * HC * N, bo_, (int64_t) T * N, cs);
+            copy_peer(hout + (size_t) T * (HC + 1) * N, inj2_, (int64_t) T * HC, cs);
             return true;
         }
         copy_from_mapped(hout, R_, (int64_t) T * HC * N, cs);

@@ -2355,7 +2355,27 @@ bool Prefill::set_stage_helper(Prefill* helper, std::string& err) {
     auto pp = std::make_unique<PeerPrefill>();
     pp->peer = nullptr;   // stream-only: it holds no experts, it streams a share of this stage's
     pp->compact = true;
-    pp->p2p = false;      // the mapped host route, whether or not the cards could reach each other (measured there)
+    // This fork runs the pair over an NVLink bridge, so the helper's activations and rows go card to card.  The pair
+    // is still asked once (cudaDeviceCanAccessPeer both ways) and enabled; the mapped host route is only the answer
+    // when the driver says the two cards cannot reach each other.
+    {
+        int a = 0, b = 0;
+        cudaDeviceCanAccessPeer(&a, m.device, h.device);
+        cudaDeviceCanAccessPeer(&b, h.device, m.device);
+        pp->p2p = a != 0 && b != 0;
+        if (pp->p2p) {
+            const core::OnDevice on0(m.device);
+            cudaError_t e0 = cudaDeviceEnablePeerAccess(h.device, 0);
+            if (e0 == cudaErrorPeerAccessAlreadyEnabled) { cudaGetLastError(); e0 = cudaSuccess; }
+            const core::OnDevice on1(h.device);
+            cudaError_t e1 = cudaDeviceEnablePeerAccess(m.device, 0);
+            if (e1 == cudaErrorPeerAccessAlreadyEnabled) { cudaGetLastError(); e1 = cudaSuccess; }
+            pp->p2p = e0 == cudaSuccess && e1 == cudaSuccess;
+        }
+        if (!pp->p2p)
+            std::fprintf(stderr, "strata: the layer split's prompt help: GPU %d and GPU %d cannot reach each other "
+                                 "(no peer access): its rows go through mapped host memory\n", m.device, h.device);
+    }
     pp->out_pipe = true;
     bool ok;
     {
@@ -2455,10 +2475,9 @@ bool Prefill::bind_stage_helper(int64_t T) {
 bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& err) {
     Impl& m = *impl_;
     if (peer == nullptr || !peer->valid()) { m.pp.reset(); return true; }
-    // Without P2P the activations and the result rows take the mapped host route of the layer split's helper
-    // (STRATA_PF_PEER_HOST=0: refuse as before, the prompt path then stays on the primary)
-    const bool host_route_ok = [] { const char* v = std::getenv("STRATA_PF_PEER_HOST"); return v == nullptr || std::atoi(v) != 0; }();
-    if (!peer->p2p() && !host_route_ok) { err = "prefill peer: the two GPUs cannot access each other (no P2P)"; return false; }
+    // This fork's peer tier is the two 2080 Ti over NVLink: no host-memory fallback.  A pair that cannot reach
+    // each other stops here instead of quietly staging every activation through pinned RAM.
+    if (!peer->p2p()) { err = "prefill peer: the two GPUs cannot access each other over NVLink (no P2P)"; return false; }
     if (!mmq_plan().any) { err = "prefill peer: needs the MMQ prompt path"; return false; }
     {   // NVFP4: the peer's MMQ products have no per-expert scales (grp_tail, row_sd); its decode rows do
         const auto& lay = strata::kernels::cpu::expert_layout();

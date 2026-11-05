@@ -142,8 +142,9 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
         int a = 0, b = 0;
         cudaDeviceCanAccessPeer(&a, primary_device(), device);
         cudaDeviceCanAccessPeer(&b, device, primary_device());
-        if (const char* np = std::getenv("STRATA_PEER_NO_P2P"); np != nullptr && std::atoi(np) != 0) a = 0;   // test knob: pretend the pair has no P2P
         p2p_ = a && b;
+        std::fprintf(stderr, "strata: peer GPU %d: cudaDeviceCanAccessPeer %d <-> %d: %d / %d (NVLink bridge assumed)\n",
+                     device, primary_device(), device, a, b);
         if (p2p_) {
             On on0(primary_device());
             cudaError_t e0 = cudaDeviceEnablePeerAccess(device, 0);
@@ -152,15 +153,14 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
             cudaError_t e1 = cudaDeviceEnablePeerAccess(primary_device(), 0);
             if (e1 == cudaErrorPeerAccessAlreadyEnabled) { cudaGetLastError(); e1 = cudaSuccess; }
             p2p_ = e0 == cudaSuccess && e1 == cudaSuccess;
-            // recommend, never force: the direct path is used only if a test copy each way arrives exact (#2666)
+            // This fork's pair is bridged (NVLink), so the host-route fallback of #2666 is gone: the test copy is
+            // still made once each way, and a pair that does not carry data stops the tier instead of using it.
             if (p2p_ && !p2p_copies_data(device)) {
-                std::fprintf(stderr, "strata: peer GPU %d: peer access is enabled but a test copy between the two GPUs arrived wrong "
-                                     "(a host bridge between them, no real P2P): the prompt path takes the host route instead "
-                                     "(STRATA_PEER_NO_P2P=1 does that by hand)\n", device);
-                { On q0(0); cudaDeviceDisablePeerAccess(device); cudaGetLastError(); }
-                { On q1(device); cudaDeviceDisablePeerAccess(0); cudaGetLastError(); }
-                p2p_ = false;
+                err = "peer experts: peer access is enabled but a test copy between GPU " + std::to_string(primary_device()) +
+                      " and GPU " + std::to_string(device) + " arrived wrong (no real NVLink path between them)";
+                return false;
             }
+            std::fprintf(stderr, "strata: peer GPU %d: peer access on, test copy each way exact (NVLink path in use)\n", device);
         }
     }
     On on(device);

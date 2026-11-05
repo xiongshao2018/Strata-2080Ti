@@ -914,6 +914,7 @@ class Host:
         child_env["STRATA_OWNER_ATTEST_KEY"] = attestation_key.hex()
         child_env["STRATA_NO_ACQUIRE"] = "1"      # a managed server never installs or downloads (acquisition.py)
         child_env["STRATA_RUNTIME_PROFILE"] = self.name   # the records of its engine say which profile they belong to
+        child_env["GGML_CUDA_P2P"] = "1"          # two RTX 2080 Ti over NVLink: the peer path is not opt-in here
         try:
             with os.fdopen(descriptor, "ab") as stream:
                 if WINDOWS:

@@ -4069,6 +4069,10 @@ def child_env(cfg: dict, *, offline: bool = False) -> dict:
         deepseek_slot_env(env, cfg)
     parallel_stack_env(env, cfg)
     gdn_stack_env(env, cfg)
+    # This fork runs two RTX 2080 Ti over an NVLink bridge, so llama.cpp's opt-in peer path is always on: the
+    # cards exchange activations and result rows directly instead of staging them through pinned host memory.
+    # Set after the config's env so a profile cannot turn it off.
+    env["GGML_CUDA_P2P"] = "1"
     # Strict offline reaches children through the environment, because a tool subprocess or a model
     # loader is code this server does not own. Applied last so a profile's own `env` cannot remove
     # the policy by naming the same variable.

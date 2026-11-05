@@ -6085,7 +6085,8 @@ def build_engine(gpu, vision, yes, llama, toolkit=None) -> Path:
     if local:
         archs = sorted(built | set(archs))
     nvcc, vcvars = install_build_tools({**gpu, "archs": archs, "toolkit": toolkit}, yes)
-    cuda_archs = ";".join(str(x) for x in archs)
+    # this fork's engine is built for two RTX 2080 Ti over NVLink only: sm_75 and nothing else, whatever the probe said
+    cuda_archs = "75"
     bdir, vdir = (ROOT / "build-cuda12", ROOT / "build-vision-cuda12") if t12 else (ROOT / "build", ROOT / "build-vision")
     if not engine_ok:
         say("  Compiling the engine for " + ", ".join(f"sm_{x}" for x in archs) + " (a card it had no code for; "
@@ -9709,10 +9710,9 @@ def main() -> int:
     ap.add_argument("--kv-streaming", choices=["auto", "on", "off"], default="auto",
                     help="from a 64K context: keep the KV cache in RAM and only the attention's window in VRAM (more "
                          "experts fit on the GPU); auto: when the RAM has room for it")
-    ap.add_argument("--backend", choices=["cuda", "hip", "sycl"],
-                    help="cuda = NVIDIA (default), hip = AMD RX 7900 / 7800 / 7700 XT, RX 9060 XT / 9070 / AI PRO R9700 on "
-                         "Linux or Windows (chosen by itself when the PC has no NVIDIA card Strata can use), "
-                         "sycl = Intel Arc, EXPERIMENTAL: Linux, built from source (docs/INTEL_ARC.md)")
+    ap.add_argument("--backend", choices=["cuda"],
+                    help="cuda = NVIDIA.  This fork is built for two RTX 2080 Ti over NVLink: the AMD (HIP) and "
+                         "Intel (SYCL) backends are not part of it")
     ap.add_argument("--skip-build", action="store_true", help=argparse.SUPPRESS)
     a = ap.parse_args()
     if a.model and a.model not in MODELS and a.family not in PREVIEW_FAMILIES and a.family not in MULTI_FILE_FAMILIES:
@@ -9720,8 +9720,10 @@ def main() -> int:
                                                               if a.model in d["models"]))
     if a.source:
         os.environ["STRATA_SOURCE"] = a.source
-    if a.prepare_pack:                                 # an Intel Arc card: the model's pack, nothing else (no engine, no download of the model)
+    if a.prepare_pack:                                 # the model's pack, nothing else (no engine, no download of the model)
         return prepare_pack_only(a)
+    if a.backend not in (None, "cuda"):
+        ap.error("this fork runs NVIDIA CUDA on two RTX 2080 Ti only: --backend " + a.backend + " is not available")
     if a.inspect:                                      # headers only: nothing is installed
         sys.exit(subprocess.run([sys.executable, str(ROOT / "tools" / "strata_inspect.py"), *a.inspect[:2]]).returncode)
     if sys.platform == "darwin" and CONTROL:           # the app on a Mac: model files only; the Metal engine is a component
@@ -9868,6 +9870,10 @@ def main() -> int:
     found = gpus()
     amd = amd_gpus()
     amd_ok = [g for g in amd if amd_problem(g) is None]
+    if amd_ok:   # this fork drives NVIDIA cards only; an AMD card is named, never silently taken instead
+        say("  This fork runs NVIDIA CUDA on two RTX 2080 Ti only: the AMD card(s) here are not used"
+            + (" (" + ", ".join(g["name"] for g in amd_ok) + ")" if amd_ok else ""))
+        amd_ok = []   # the HIP branch below is never chosen on this fork
     # older NVIDIA GPUs (Pascal / Volta): the experimental CUDA 12 engine, when chosen (docs/OLDER_GPUS.md)
     OLD_GPUS = OLD_GPUS or old_gpus_opt_in(found, named_gpus(a.gpu, a.gpus), a.cuda,
                                            other=bool(amd_ok) or a.backend == "hip")

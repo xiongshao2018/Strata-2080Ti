@@ -1,23 +1,20 @@
 #!/bin/sh
-# Build the Linux CUDA engine package for the release feed.
+# Build the Linux CUDA engine package for two RTX 2080 Ti cards (Turing, compute capability 7.5) over NVLink.
 #
-#   VARIANT=cuda12 packaging/build_cuda_linux.sh     # CUDA 12.9: GTX 10 (Pascal), Tesla P100, V100, and the newer cards up to sm_89
-#   VARIANT=cuda13 packaging/build_cuda_linux.sh     # CUDA 13: RTX 20 and newer (sm_75 .. sm_120)
+#   VARIANT=cuda13 packaging/build_cuda_linux.sh     # CUDA 13, machine code for sm_75 only
 #
 # Run it on a Linux x86_64 box with the CUDA toolkit of that variant on PATH (nvcc), a Python 3 venv with requirements.txt and
 # requirements-build.txt, and the pinned llama.cpp in third_party/llama.cpp (python -c "import setup; setup.get_llama_cpp()").
 # The package lands in $OUT (default ./out-engine-<variant>). Nothing is uploaded.
 #
-# The cuda12 package is the one the feed and docs/DOCKER.md offer to Pascal and Volta cards, so it needs machine code for sm_60,
-# sm_61 and sm_70 and the -DSTRATA_EXPERIMENTAL_SM60=ON build (#3503: the 0.2.1 package had sm_75 / 86 / 89 only, and a P100
-# container restarted in a loop with "this PC's GPU is sm_60"). packaging/package_engine.py refuses a cuda12 package without them.
+# This fork targets one hardware pair, so the architecture list is not a variable any more: 75 only. The cuda12 variant
+# (Pascal / Volta, sm_60 / 61 / 70) is refused here rather than built with code this fork never runs.
 set -eu
 variant=${VARIANT:-cuda13}
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
 case "$variant" in
-  cuda12) archs=${ARCHS:-60;61;70;75;80;86;89}; mindriver=575.51; sm60=ON ;;
-  cuda13) archs=${ARCHS:-75;86;89;120}; mindriver=580.65; sm60=OFF ;;
-  *) echo "build_cuda_linux.sh: VARIANT must be cuda12 or cuda13" >&2; exit 2 ;;
+  cuda13) archs=75; mindriver=580.65; sm60=OFF ;;
+  *) echo "build_cuda_linux.sh: this fork builds the cuda13 (sm_75) engine only; VARIANT=$variant is not supported" >&2; exit 2 ;;
 esac
 out=${OUT:-$repo/out-engine-$variant}
 build=${BUILD:-$repo/build-$variant}

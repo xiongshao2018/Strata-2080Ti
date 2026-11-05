@@ -1750,6 +1750,34 @@ void copy_rows_strided(float* dst, const float* src, int64_t rows, int64_t w, in
     check("copy_rows_strided");
 }
 
+// ---- layer split over NVLink: a peer copy as a kernel (see verify_kernels.hpp)
+namespace {
+__global__ void copy_peer_kernel(float4* __restrict__ dst, const float4* __restrict__ src, long long n4) {
+    for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < n4;
+         i += (long long) gridDim.x * blockDim.x)
+        dst[i] = src[i];
+}
+__global__ void copy_peer_scalar_kernel(float* __restrict__ dst, const float* __restrict__ src, long long n) {
+    for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += (long long) gridDim.x * blockDim.x)
+        dst[i] = src[i];
+}
+}  // namespace
+void copy_peer(float* dst, const float* src, long long n, void* stream) {
+    if (dst == nullptr || src == nullptr || n <= 0) return;
+    if (((uintptr_t) dst & 15) == 0 && ((uintptr_t) src & 15) == 0 && (n & 3) == 0) {
+        const long long n4 = n / 4;
+        const long long want = (n4 + 255) / 256;
+        const unsigned blocks = (unsigned) (want < 256 ? want : 256);
+        copy_peer_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>((float4*) dst, (const float4*) src, n4);
+    } else {
+        const long long want = (n + 255) / 256;
+        const unsigned blocks = (unsigned) (want < 256 ? want : 256);
+        copy_peer_scalar_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>(dst, src, n);
+    }
+    check("copy_peer");
+}
+
 // ---- programmatic dependent launch (pdl.hpp)
 bool& pdl_scope() {
     static thread_local bool on = false;

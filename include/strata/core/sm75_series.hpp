@@ -1,10 +1,10 @@
 // strata/core/sm75_series.hpp - the Turing (RTX 20, compute capability 7.5) kernel series: one opt-in switch.
 //
 // The Turing kernels of PRs #2069-#2072, #2081, #2091-#2093, #2145-#2146, #2220-#2223, #1821 were measured on one RTX
-// 2080 Ti (and a CMP 50HX) and are bitwise equal to the kernels they replace.  We have no sm_75 card to confirm them, so
-// they are ON ONLY WHEN ASKED FOR:
+// 2080 Ti (and a CMP 50HX) and are bitwise equal to the kernels they replace.  This fork runs two RTX 2080 Ti, so the
+// series is ON BY DEFAULT; the switch below turns it off:
 //
-//   STRATA_SM75_PERF=1   turns on every bitwise Turing kernel of the series on a compute capability 7.5 card.
+//   STRATA_SM75_PERF=0   turns off every bitwise Turing kernel of the series.
 //
 // Each kernel keeps the author's own switch, which wins over STRATA_SM75_PERF in both directions (=0 off, =1 on, on any
 // card where the PR said so for tests).  Nothing here changes a card that is not a 7.5: the check is the card's compute
@@ -21,11 +21,12 @@
 
 namespace strata {
 
-/// STRATA_SM75_PERF=1 (read once)
+/// STRATA_SM75_PERF=0 turns it off (read once).  This fork runs sm_75 cards only, so the series is ON by default:
+/// every kernel in it is bitwise equal to the one it replaces, and the switch is kept only as an escape hatch.
 inline bool sm75_series() {
     static const bool on = [] {
         const char* e = std::getenv("STRATA_SM75_PERF");
-        return e != nullptr && std::atoi(e) != 0;
+        return e == nullptr || std::atoi(e) != 0;
     }();
     return on;
 }

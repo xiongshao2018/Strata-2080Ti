@@ -844,7 +844,9 @@ int bf16_path() {
     if (cc <= 0 || cc >= 80) return 0;
     if (cc < 70) return 2;
     if (forced >= 0) return forced != 0 ? 1 : 0;
-    return cc < 75 ? 1 : 0;
+    // sm_75 (two RTX 2080 Ti): the FP16 tensor-core path is the default here (docs/OLDER_GPUS.md measured prompt
+    // +15-18% on a 2080 Ti); STRATA_BF16_TC=0 still asks for cuBLAS's BF16 GEMM
+    return cc <= 75 ? 1 : 0;
 }
 bool grow(uint16_t*& p, int64_t& have, int64_t want) {   // `have`, `want`: 2-byte elements
     if (have >= want) return true;

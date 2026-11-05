@@ -10,6 +10,10 @@ settings go into the run config (`strata-*.json`) as `"args"` entries; they are 
 
 ## How it works
 
+> **This fork** targets two NVIDIA RTX 2080 Ti over an NVLink bridge. `--peer-device` and the helper caches below are
+> upstream paths kept as-is; this fork's own layer split does not use them (it hands its rows over NVLink - see
+> [MULTI_GPU.md](MULTI_GPU.md#how-the-split-works)).
+
 CUDA0 keeps the dense layers, the KV and state, the draft layer (MTP) and its own expert cache. Up to three independent expert
 caches fill CUDA1, CUDA2 and CUDA3 in that order. Each expert has one owner: CUDA0, one helper card, or the CPU pool. Each
 helper computes its rows while the CPU pool works, and the results return through private pinned host buffers before CUDA0
@@ -81,9 +85,10 @@ NVLink or another peer-to-peer path. It is an alternative to the helper caches a
 | `--peer-adapt-swaps N` | -1 | Swaps per adaptive round on the peer; -1 uses the primary's `--adapt-swaps`. |
 | `--peer-prefill-rows N` | -1 | Share of each prompt chunk's rows the peer computes; -1 is half of chunk x top-k, 0 keeps prompt rows on the primary. |
 
-Whether the two cards can really exchange data is tested once at start with a copy each way. If the copy arrives wrong, the log
-says so and the prompt path uses the host route (activations and rows through mapped host memory). `STRATA_PEER_NO_P2P=1` asks
-for that route by hand.
+Whether the two cards can really exchange data is tested once at start with a copy each way. **In this fork the test is not a
+suggestion:** a copy that arrives wrong stops the tier with an error instead of falling back to the host route, because a
+silently degraded path on a bridged pair would produce wrong answers rather than slow ones. Upstream keeps the fallback and
+`STRATA_PEER_NO_P2P=1` as its manual switch; this fork removed the variable.
 
 Through the server, list both cards in the config's `"gpu"` (for example `[0, 1]`, numbered as `nvidia-smi` numbers them) and add
 `--peer-device 1` to `"args"`. The number is the card's position in that list (with `"gpu": [2, 0]`, `--peer-device 1` is

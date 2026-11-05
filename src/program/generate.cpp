@@ -2459,7 +2459,7 @@ static bool pcie_auto_split_ok() {
 // median would still follow a disturbance that lasts through half the bursts).  Each burst takes ~10 ms on an x16
 // PCIe 4 link, so the probe takes no longer than the one 1 GiB burst did.  `samples`, when given, gets every
 // burst's reading for the log.
-double g_last_h2d_gbps = -1.0;   // the last probe's reading, for the prompt planner (#2824)
+double g_last_h2d_gbps = -1.0;   // the fastest probe's reading, for the prompt planner (#2824, see the update below)
 double probe_pcie_h2d_gbps(std::string* samples = nullptr) {
     constexpr size_t kBytes = 256ull << 20;
     constexpr int kBursts = 4;
@@ -2515,7 +2515,12 @@ double probe_pcie_h2d_gbps(std::string* samples = nullptr) {
     if (!ok) (void) cudaGetLastError();
     cudaFree(d);
     cudaFreeHost(h);
-    if (bw > 0.0) g_last_h2d_gbps = bw;
+    // The prompt planner reads this as "the host->device bandwidth the prompt path will see".  On a layer split
+    // the stages are probed one after another, so the LAST reading used to win - and on this rig that is the
+    // PCH-attached card's x1 link (0.8 GB/s) rather than the primary card's x16 (12.4 GB/s), which planned the
+    // prompt chunk against a link the prompt path never uses.  Keep the fastest reading instead: it is the one
+    // the planner's copy term is about.
+    if (bw > 0.0) g_last_h2d_gbps = std::max(g_last_h2d_gbps, bw);
     return bw;
 }
 
@@ -10855,12 +10860,17 @@ int main(int argc, char** argv) {
         };
         auto pcie_num_of = [](double f) { return std::max(0, std::min(256, (int) (f * 256.0 + 0.5))); };
         const int n_stages = split_devs.empty() ? 1 : (int) split_at.size() + 1;
-        // a layer split's hand-off buffers (and its pipelined windows) hold kVerifyMaxT rows: --lookup-max-t stops there
+        // a layer split's hand-off buffers hold kVerifyNarrowT rows: --lookup-max-t stops there
         if (n_stages > 1 && o.spec > strata::kernels::kVerifyNarrowT) {
             std::fprintf(stderr, "strata serve: --lookup-max-t %d: a layer split's windows stop at %d tokens\n",
                          o.lookup_max_t, strata::kernels::kVerifyNarrowT);
             o.spec = strata::kernels::kVerifyNarrowT;
         }
+        // the card of stage s (stage 0 is the primary, 0 with a layer split)
+        auto stage_dev = [&](int s) -> int { return s == 0 ? 0 : stages[(size_t) s - 1]->dev; };
+        // this fork's layer split hands its rows over NVLink: the buffer sits in the reading stage's VRAM and the
+        // copies go card to card (both directions' peer access enabled below).  Set inside the n_stages > 1 block.
+        bool peer_hand = false;
         // --pipeline-windows (decided where the split was): two verifiers per stage, one for the even windows and one
         // for the odd ones, sharing one stream of their card, and a hand-off per parity - so stage 0 can run window
         // K+1 while stage 1 still reads window K's hand-off.  With more stages every stage but the last is a "front"
@@ -10900,15 +10910,44 @@ int main(int argc, char** argv) {
                                                          std::min<int>(o.batch, strata::kernels::kVerifyMaxT))
                                          : strata::kernels::kVerifyNarrowT;
             const size_t hb = (size_t) hrows * (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
+            // This fork runs the split over an NVLink bridge (two RTX 2080 Ti): the hand-off lives in the receiving
+            // card's VRAM and the rows cross with cudaMemcpyPeerAsync, never through pinned host memory.  The test
+            // copy in PeerExperts is the one runtime check kept; --split-device 0 stays on the mapped route (both
+            // stages are one card, so there is no peer to copy over).
+            if (!split_same && n_stages == 2) {
+                int a = 0, b = 0;
+                cudaDeviceCanAccessPeer(&a, stage_dev(0), stage_dev(1));
+                cudaDeviceCanAccessPeer(&b, stage_dev(1), stage_dev(0));
+                peer_hand = a != 0 && b != 0;
+                if (!peer_hand)
+                    std::fprintf(stderr, "strata serve: the layer split's hand-off over NVLink is off (GPU %d and GPU %d "
+                                         "cannot reach each other); the mapped host route is used\n",
+                                 stage_dev(0), stage_dev(1));
+            }
+            if (peer_hand) {   // both ways: the copies below need it enabled
+                { strata::core::OnDevice on(stage_dev(0)); cudaDeviceEnablePeerAccess(stage_dev(1), 0); cudaGetLastError(); }
+                { strata::core::OnDevice on(stage_dev(1)); cudaDeviceEnablePeerAccess(stage_dev(0), 0); cudaGetLastError(); }
+                std::fprintf(stderr, "strata serve: layer split hand-off over NVLink (GPU %d <-> GPU %d, peer access on)\n",
+                             stage_dev(0), stage_dev(1));
+            }
             std::vector<float*> hand((size_t) n_stages - 1, nullptr);
-            for (float*& h : hand) {
-                float* hh = nullptr;
-                if (cudaHostAlloc((void**) &hh, hb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
-                    cudaHostGetDevicePointer((void**) &h, hh, 0) != cudaSuccess) {
-                    std::fprintf(stderr, "strata serve: the layer-split hand-off allocation failed\n");
-                    return 1;
+            for (size_t i = 0; i < hand.size(); ++i) {
+                if (peer_hand) {
+                    const strata::core::OnDevice on(stage_dev((int) i + 1));   // the reading stage's card
+                    if (cudaMalloc((void**) &hand[i], hb) != cudaSuccess) {
+                        std::fprintf(stderr, "strata serve: the layer-split hand-off allocation failed\n");
+                        return 1;
+                    }
+                    cudaMemset(hand[i], 0, hb);
+                } else {
+                    float* hh = nullptr;
+                    if (cudaHostAlloc((void**) &hh, hb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+                        cudaHostGetDevicePointer((void**) &hand[i], hh, 0) != cudaSuccess) {
+                        std::fprintf(stderr, "strata serve: the layer-split hand-off allocation failed\n");
+                        return 1;
+                    }
+                    std::memset(hh, 0, hb);
                 }
-                std::memset(hh, 0, hb);
             }
             // STRATA_SPLIT_OVERLAP=1 (opt-in; measured on 2x RX 7900 XTX only): a ready word per hand-off, raised by the
             // writing stage's GPU, so the next stage's window is launched early and the host never syncs between
@@ -10917,7 +10956,10 @@ int main(int argc, char** argv) {
                 const char* v = std::getenv("STRATA_SPLIT_OVERLAP");
                 return v != nullptr && std::atoi(v) != 0;
             }();
-            // --pipeline-windows (#859) runs its own overlapped loop with its own hand-offs: the two do not mix
+            // --pipeline-windows (#859) runs its own overlapped loop with its own hand-offs: the two do not mix.
+            // The overlapped split publishes with a kernel that stores into the hand-off pointer.  Under NVLink that
+            // pointer is the next stage's VRAM (peer access is on), so the same kernel becomes a peer store: the rows
+            // cross on the bridge and the ready word is still the mapped host word the next stage spins on.
             const bool overlap = overlap_asked && !split_same && o.pipeline_windows == 0;
             if (overlap_asked && o.pipeline_windows > 0)
                 std::fprintf(stderr, "strata serve: STRATA_SPLIT_OVERLAP is off beside --pipeline-windows %d "
@@ -10937,6 +10979,8 @@ int main(int argc, char** argv) {
             for (int st = 0; st < n_stages; ++st) {
                 stage_ver(st).set_stage(st == 0 ? 0 : split_at[(size_t) st - 1], st + 1 < n_stages ? split_at[(size_t) st] : -1,
                                         st == 0 ? nullptr : hand[(size_t) st - 1], st + 1 < n_stages ? hand[(size_t) st] : nullptr);
+                if (peer_hand)   // NVLink: the buffer is the other stage's VRAM, the copy switches cards
+                    stage_ver(st).set_handoff_peer(stage_dev(st + 1 == n_stages ? st - 1 : st + 1));
                 if (hrows > strata::kernels::kVerifyNarrowT) stage_ver(st).set_handoff_rows(hrows);
 #if defined(STRATA_HAVE_DFLASH2)
                 if (use_df2 && st > 0) stage_ver(st).set_taps(df2.tap_layers());   // (stage 0 gets its taps below, as on one card)
@@ -10997,21 +11041,32 @@ int main(int argc, char** argv) {
             const size_t hb = (size_t) strata::kernels::kVerifyNarrowT *
                               (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
             std::vector<float*> hand_b((size_t) n_stages - 1, nullptr);   // the odd windows' hand-off per boundary
-            for (float*& h : hand_b) {
-                float* hh = nullptr;
-                if (cudaHostAlloc((void**) &hh, hb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
-                    cudaHostGetDevicePointer((void**) &h, hh, 0) != cudaSuccess) {
-                    std::fprintf(stderr, "strata serve: --pipeline-windows: the second hand-off allocation failed\n");
-                    return 1;
+            for (size_t i = 0; i < hand_b.size(); ++i) {
+                if (peer_hand) {   // NVLink, as the even windows' hand-off: the reading stage's card holds it
+                    const strata::core::OnDevice on(stage_dev((int) i + 1));
+                    if (cudaMalloc((void**) &hand_b[i], hb) != cudaSuccess) {
+                        std::fprintf(stderr, "strata serve: --pipeline-windows: the second hand-off allocation failed\n");
+                        return 1;
+                    }
+                    cudaMemset(hand_b[i], 0, hb);
+                } else {
+                    float* hh = nullptr;
+                    if (cudaHostAlloc((void**) &hh, hb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+                        cudaHostGetDevicePointer((void**) &hand_b[i], hh, 0) != cudaSuccess) {
+                        std::fprintf(stderr, "strata serve: --pipeline-windows: the second hand-off allocation failed\n");
+                        return 1;
+                    }
+                    std::memset(hh, 0, hb);
                 }
-                std::memset(hh, 0, hb);
             }
             ver_b.set_stage(0, split_at[0], nullptr, hand_b[0]);
+            if (peer_hand) ver_b.set_handoff_peer(stage_dev(1));
             for (int st = 1; st < n_stages; ++st) {
                 GpuStage& gs = *stages[(size_t) st - 1];
                 const bool last = st + 1 == n_stages;
                 gs.ver_b.set_stage(split_at[(size_t) st - 1], last ? -1 : split_at[(size_t) st], hand_b[(size_t) st - 1],
                                    last ? nullptr : hand_b[(size_t) st]);
+                if (peer_hand) gs.ver_b.set_handoff_peer(stage_dev(st));
                 const strata::core::OnDevice on(gs.dev);
                 strata::core::VerifyHits vs;
                 vs.d_res = gs.d_res;

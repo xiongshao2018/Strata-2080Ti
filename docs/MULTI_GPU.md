@@ -3,9 +3,15 @@
 This page is for people with two or more graphics cards of the same make in one PC. A layer split puts one model on
 several cards. NVIDIA is described here; AMD limits and measurements are in [AMD_HIP.md](AMD_HIP.md).
 
+> **This fork targets one hardware pair:** two NVIDIA RTX 2080 Ti (compute capability 7.5) joined by an **NVLink
+> bridge**, on Linux. The engine is compiled for sm_75 only, and the AMD (HIP), Intel (SYCL) and Apple Metal paths are
+> not part of it. The layer split's hand-off goes card to card over NVLink instead of through pinned host memory - see
+> [How the split works](#how-the-split-works) and [Measured on two RTX 2080 Ti](#measured-on-two-rtx-2080-ti).
+
 > **On this page:** [Using it](#using-it) · [Main, Helper, Off](#main-helper-off) · [How the split works](#how-the-split-works) ·
 > [Tuning options](#tuning-options) · [Pipeline windows](#pipeline-windows) · [Two models on two cards](#two-models-on-two-cards) ·
-> [DeepSeek](#deepseek-v41-flash) · [Limits](#limits) · [History](#history--older-measurements)
+> [DeepSeek](#deepseek-v41-flash) · [Limits](#limits) · [History](#history--older-measurements) ·
+> [Measured on two RTX 2080 Ti](#measured-on-two-rtx-2080-ti)
 
 ## Using it
 
@@ -99,8 +105,15 @@ last card also runs the output head and the draft (MTP) layer. Each card keeps a
 cards hold about twice the experts one card holds.
 
 This is pipeline parallelism, not tensor parallelism. A token crosses from one card to the next once per verify window (a few
-hundred KB through pinned RAM). No NVLink or peer-to-peer access is needed, cards on x4 or x1 slots work, and each card's PCIe
-share is probed on its own link. A `--pcie-frac` you give applies to every card and skips those probes.
+hundred KB). Upstream stages that through pinned RAM, so no NVLink or peer-to-peer access is needed and cards on x4 or x1 slots
+work. **This fork does not:** the hand-off buffer lives in the reading stage's VRAM and the rows cross with a copy kernel over
+the NVLink bridge, after `cudaDeviceEnablePeerAccess` both ways. Peer access is checked once at start (`cudaDeviceCanAccessPeer`
+each way, then a test copy each way); a pair that cannot reach each other does not silently fall back to RAM - the layer split
+says so, and the mapped route is used only when `--split-device 0` puts both stages on one card.
+
+`nvidia-smi topo -m` should show `NV2` between the two cards and `nvidia-smi topo -p2p n` should say `OK` both ways. Each card's
+PCIe share is still probed on its own link (a `--pcie-frac` you give is every card's share); the NVLink bridge carries the
+layer hand-off, not the PCIe slots.
 
 **What each card holds**
 
@@ -311,3 +324,83 @@ cold 19.9K prompt; one run per arm (community report #1447, not repeated here).
 | `--pipeline-windows 2` | 136.7 | 2,097 |
 | `STRATA_PF_FUSED=1` | 137.2 | 1,913 |
 | pipeline-windows 2 + async + lag 2 + rotate + pf_fused | 142.0 | 2,302 |
+
+<a id="measured-on-two-rtx-2080-ti"></a>
+
+## Measured on two RTX 2080 Ti
+
+This fork's pair: two RTX 2080 Ti (11 GB each, sm_75), NVLink `NV2` bridge between them, **the second card on a chipset
+root port that negotiates x1 Gen2** (`/sys/bus/pci/devices/0000:05:00.0/current_link_width` = 1, the first card on x16
+Gen3). Qwen3.8-Flash IQ3_S, `--spec 4`, 262144-token context, `--kv k8v4`, engine 0.1.56. The x1 link is why the second
+card's share of the layers is kept small: the NVLink bridge carries the hand-off, but every expert that card pulls from
+RAM crosses x1.
+
+**Where the split goes is the single biggest knob.** A split of 40/8 keeps only 11154 expert slots and leaves the second
+card idle for most of the window: stage 0 waited 18.7 ms per window against the pool while stage 1 waited 0. Stage 0 is
+the critical path, so a smaller share on it wins even though the second card's expert tier is slower to fill. Sweeping
+the split point on 400-token runs (median of 3-5, same configuration otherwise):
+
+| `--layer-split` | decode tok/s | expert slots |
+|---|---|---|
+| 28 | 67.3 | 15262 |
+| 30 | 68.1-71.2 (noisy) | 15190 |
+| **32** | **69.5-70.0 (most stable)** | **15105** |
+| 34 | 66.7 | 14800 |
+| 36 | 64.2 | 13514 |
+| 40 | 62.9-66.6 | 11154 |
+
+32 is the choice: it gives up ~1 tok/s of best-case peak against 30 in exchange for a 5665-5804 ms spread over five runs
+instead of 5503-6148 ms. The two stages then measure 14.9 ms and 7.8 ms per window (wait for the GPU) - still unequal,
+which is the second card's x1 link, but no longer 2.4:1.
+
+**The adaptive tier must stay on.** Decode here is dominated by expert-cache misses: with `--adapt-async` off the hit rate
+sat at 40% and decode was 51 tok/s; with it on the rate settled at 96-98%.
+
+**`--batch-groups 2`** pipelining the two stages was worth ~15% over the serial loop (49-52 -> 58-63 tok/s on 512-token
+runs). **`--pipeline-windows 2` is slower here** even at split 32 (66.8 vs 69.9 tok/s): the second verifier's arena and
+graphs cost more VRAM than the overlap returns, and the expert cache shrinks to 14865 slots. It stays off.
+`STRATA_SPLIT_OVERLAP=1` works over NVLink in this fork (the publish kernel stores into the peer card's VRAM directly);
+its output is token-for-token identical to the serial loop, but it measured level here (69.7 vs 69.9), so it is left off
+as well.
+
+**Two CPU-side knobs are worth ~6% together.** The pool is on the critical path of every window's doorbell, and the
+default worker count is one short of this 24-core/32-thread CPU:
+
+| setting | tok/s |
+|---|---|
+| defaults (`pool_workers=15`) | 62.9 |
+| `--pool-workers 24 --aux-cpus auto` | 66.6 |
+| `--pool-workers 24 --aux-cpus auto`, split 32 | 69.9 |
+| `--pool-workers 32` | 50.1 (oversubscribed) |
+
+`--aux-cpus auto` keeps the adaptive tier's job thread and the CUDA driver's threads off the pool workers' cores.
+`--pool-workers 24` occupies every physical core, so leave it off if the same machine is doing other work.
+
+**Speculation depth.** `--spec 4` with `--spec-min-p 0.6` measured 71.6 tok/s against 69.4 at the old 0.5 default (median
+of 4). The draft is accepted 80%/67%/67% at depths 1-3, so cutting the tail below 0.6 is nearly free; 0.75 and 0.85 fell
+to 69.1 and 63.8 because they also drop the depth-2 drafts that do land. `--spec 3` and `--spec 6`-`8` were 68.2 and
+60.6-55.9.
+
+Keep `--vram-reserve-mib 1500` as measured: taking it down to 900 for more slots did not help.
+
+**Long-context production settings (2026-11-05).** `--layer-split 32 --expert-cache 8000 --vram-reserve-mib 1500
+--vram-reserve-later-mib 2100 --kv k8v4 --pipeline-windows 0 --adapt-async 1 --adapt-min-gain 2.0
+--conversation-cache-slots 3 --conversation-cache-park-gain 1024 --pool-workers 24 --aux-cpus auto --spec 4
+--spec-min-p 0.6 --resident-experts --trim-stage-weights --batch-groups 2`, with `GGML_CUDA_P2P=1`,
+`STRATA_SPLIT_OWN_BUFFERS=1` and `STRATA_PCIE_FRAC_DEFAULT=old`. First token (ms) and decode (tok/s), cold reads:
+
+| Prompt tokens | TTFT (ms) | decode (tok/s) |
+| ---: | ---: | ---: |
+| 512 | 6367 | 81.6 |
+| 4096 | 15792 | 77.6 |
+| 8192 | 23930 | 80.3 |
+| 32768 | 68464 | 72.3 |
+
+The 32K row is the x1 link showing: the second card's prompt chunks and its 3% expert misses queue behind 0.8 GB/s, so
+TTFT grows faster than the token count does.
+
+**The prompt planner used to be told the wrong link.** `probe_pcie_h2d_gbps` keeps the fastest of its four bursts, but the
+*variable* the prompt planner reads was overwritten by each probe in turn; on a layer split the stages are probed in
+order, so the last reading - the second card's x1 link at 0.8 GB/s - set the plan for a prompt path that runs on the
+first card's x16. The plan line read `PCIe 0.8 GB/s` and chunked the prompt against it. It now keeps the fastest reading
+(`g_last_h2d_gbps = std::max(...)`) and reports `PCIe 12.4 GB/s`.

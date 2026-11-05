@@ -109,6 +109,13 @@ void gpu_noop(void* stream);
 /// w and src_w multiples of 4 floats, both pointers 16-byte aligned.
 void copy_rows_strided(float* dst, const float* src, int64_t rows, int64_t w, int64_t src_w, void* stream);
 
+/// Layer split over NVLink: dst[0, n) = src[0, n) with a copy kernel, so a hand-off crosses the peer bridge
+/// (cudaDeviceEnablePeerAccess makes the other card's VRAM plainly addressable here) and the window stays capturable:
+/// cudaMemcpyPeerAsync is refused inside a stream capture (cudaErrorStreamCaptureUnsupported), and a memcpy node would
+/// also break the kernel-to-kernel chain of the window graph.  When both ends are on this card it is a plain local
+/// copy.  n may be any count; the float4 path is taken when n and both pointers allow it.
+void copy_peer(float* dst, const float* src, long long n, void* stream);
+
 // ---- perf-review E-6: a layer whose routed experts are all in VRAM needs nothing from the host
 /// One group's plan, built on the device when every routed expert of its n*k entries is resident: the host pool's
 /// layout (counts | start | dst | tok | pad | ptr | ptr2 | start2, `capx` entries) and order (distinct experts in

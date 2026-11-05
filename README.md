@@ -14,6 +14,11 @@
   <a href="#help">Help</a> · <a href="#support-strata">Support</a>
 </p>
 
+> **This fork:** two NVIDIA RTX 2080 Ti (sm_75) over an NVLink bridge, Linux. The engine is compiled for sm_75 only and
+> the layer split hands its rows over NVLink instead of pinned host memory - see [multi-GPU](docs/MULTI_GPU.md). The AMD
+> (HIP), Intel (SYCL) and Apple Metal paths are not part of this fork. `nvidia-smi topo -p2p n` must report `OK`
+> between the two cards, or the layer split refuses the NVLink hand-off and says so.
+
 <p align="center">
   <a href="https://github.com/Niko1221/Strata/releases/latest"><img src="https://img.shields.io/github/v/release/Niko1221/Strata?label=download&color=0ab887" alt="Download Strata"></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/Niko1221/Strata" alt="MIT license"></a>

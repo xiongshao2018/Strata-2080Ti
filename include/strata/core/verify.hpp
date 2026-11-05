@@ -191,6 +191,16 @@ public:
     void set_stage(int64_t layer_begin, int64_t layer_end, const float* handoff_in, float* handoff_out) {
         lb_ = layer_begin; le_ = layer_end; hand_in_ = handoff_in; hand_out_ = handoff_out;
     }
+    /// LAYER SPLIT OVER NVLink: the hand-off buffers above live in the peer card's VRAM instead of mapped host
+    /// memory, and the rows cross with one cudaMemcpyPeerAsync per window (no host staging).  `peer_device` is the
+    /// card the OTHER stage of this boundary runs on; this stage switches to it for the copy and back.  Set after
+    /// set_stage, before init; the mapped route stays the default (set_handoff_peer(-1) turns it off again).
+    void set_handoff_peer(int peer_device) { hand_peer_dev_ = peer_device; }
+    /// Whether this stage hands off over the peer card's memory (set_handoff_peer was given a device).
+    bool handoff_over_peer() const { return hand_peer_dev_ >= 0; }
+    /// The card a hand-off of this stage touches besides its own (its `device_` when it has none): for the peer
+    /// access setup of the engine.
+    int handoff_peer_device() const { return hand_peer_dev_; }
     /// The rows the hand-off buffers of `set_stage` hold (0: kVerifyMaxT, the default).  More than --batch's 8 slots on a
     /// layer split: the pipelined slot groups write their rows at hbase = group * rows-per-group, one row per slot.
     void set_handoff_rows(int rows) { handoff_rows_ = rows; }
@@ -573,6 +583,7 @@ private:
     int handoff_rows_ = 0;               ///< set_handoff_rows (0: kVerifyNarrowT)
     const float* hand_in_ = nullptr;
     float* hand_out_ = nullptr;
+    int hand_peer_dev_ = -1;   ///< the other stage's card when the hand-off is VRAM on it (set_handoff_peer)
     uint32_t* hflag_in_h_ = nullptr;     ///< set_handoff_flags: the incoming hand-off's ready word (host / device)
     uint32_t* hflag_in_d_ = nullptr;
     uint32_t* hflag_out_h_ = nullptr;    ///< ... and the outgoing one's
