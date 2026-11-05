@@ -404,3 +404,20 @@ TTFT grows faster than the token count does.
 order, so the last reading - the second card's x1 link at 0.8 GB/s - set the plan for a prompt path that runs on the
 first card's x16. The plan line read `PCIe 0.8 GB/s` and chunked the prompt against it. It now keeps the fastest reading
 (`g_last_h2d_gbps = std::max(...)`) and reports `PCIe 12.4 GB/s`.
+
+**Engine 0.1.56 retunes the reserve, not the split.** 0.1.56 uses more prompt-path room, so the same 1500 MiB reserve
+dropped the split-32 pair from 14630 to 12946 expert slots. Sweeping only the first card's reserve, with
+`--expert-cache 8000` kept as the requested ceiling:
+
+| `--vram-reserve-mib` | CUDA0 slots | total slots | cold 32K decode |
+| ---: | ---: | ---: | ---: |
+| 1500 | 5626 | 12946 | 24.3-84.4 tok/s (noisy) |
+| 1200 | 5744 | 13063 | stable, no degradation warning |
+| 800 | 5902 | 13221 | marginal gain, more OOM risk |
+
+1200 is the production choice: it returns the prompt-path margin 0.1.56 needs without giving up the reserve's guardband.
+`--vram-reserve-later-mib 2100` stays untouched - it protects the later card, not CUDA0. The long-context production
+settings are the same as above, with `--vram-reserve-mib 1200` and `STRATA_PARK_ASYNC=1` added. `STRATA_PARK_VRAM_MIB`
+does not override the engine's `want + 768 MiB` free-VRAM gate in `vram_kv_take`; after an 8000-slot expert cache CUDA0
+has less than that beside the prompt path, so 32K K/V parks go through the pinned host stage. That stage still parks a
+62656-token image in about 1.0-1.2 s, and a warm cached read restores in about 160 ms. It is not the 68 s cold prefill.
