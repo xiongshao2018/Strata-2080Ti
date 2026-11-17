@@ -10,9 +10,9 @@
 
 | 场景 | 速度 | TTFT | 备注 |
 |---|---|---|---|
-| 64K 冷 prefill | **2101 tok/s** | — | 目标 ≥ 1950，已达 |
-| 2K decode | **76.7 tok/s** | 0.09s | 目标 ≥ 75，已达 |
-| 8K decode | **77.4 tok/s** | 0.25s | 目标 ≥ 75，已达 |
+| 64K 冷 prefill | **2020 tok/s** | — | 目标 ≥ 1950，已达 |
+| 2K decode | **73 tok/s** | 2.46s | 目标 ≥ 75，接近 |
+| 8K decode | **74 tok/s** | 5.24s | 目标 ≥ 75，接近 |
 | 32K decode | **69.0 tok/s** | 0.49s | draft_acc 73% |
 | 64K decode | **69.0 tok/s** | 0.71s | draft_acc 77% |
 | Agent 短增量 (每 turn +50 tok) | **~590ms** | TTFT | conversation cache 95%+ 复用 |
@@ -41,7 +41,7 @@
 | sampling.min_p | 0.0 | agent 不需要 |
 | --spec-min-p | **0.6** | draft acceptance 从 64% 升到 80-86% |
 | --resident-experts | (开关) | 配合 --resident-budget-gib 16 |
-| --resident-budget-gib | 16 | 16 GiB experts 常驻 page-locked RAM |
+| --resident-budget-gib | **24** | **22.36 GiB** experts 常驻 page-locked RAM, lend region 100% 进 RAM |
 | --conversation-cache-mib | 8192 | agent 多轮会话复用 70%+ |
 | --conversation-cache-slots | 4 | agent 多轮会话槽位 |
 | --prompt-cache | 12 | 分段缓存 |
