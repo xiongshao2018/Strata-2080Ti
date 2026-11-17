@@ -4031,6 +4031,12 @@ bool FileExpertSource::pin_cache_complement(
     std::atomic<bool> failed{false};
     std::mutex fail_mu;
     const auto copy_t0 = std::chrono::steady_clock::now();
+    // GGUF in place: release the file pages a copied blob was read from, so the complement is not a second copy of
+    // bytes the page cache already holds (see the per-layer release below).  STRATA_COMPLEMENT_DROP_PAGES=0 keeps them.
+    const bool drop_pages = [] {
+        const char* v = std::getenv("STRATA_COMPLEMENT_DROP_PAGES");
+        return v == nullptr || v[0] == '\0' || std::atoi(v) != 0;
+    }();
     std::string fail_msg;
     auto fail = [&](const std::string& m) {
         std::lock_guard<std::mutex> lock(fail_mu);
@@ -4107,6 +4113,57 @@ bool FileExpertSource::pin_cache_complement(
                 return;
             }
 #endif
+            } else if (drop_pages && direct_.empty()) {
+                // The GGUF in place (--mmap-experts): the same duplicate, one mapping per shard.  The copy above put
+                // this layer's blobs into the page-locked complement, and the mapped pages they were read from stay
+                // in the page cache, so the machine holds those bytes twice - measured on this pair as 16.0 GiB of
+                // pinned RAM beside 20.8 GiB of private-clean file pages, the same experts in both.  Give back the
+                // pages of the blobs the copy kept; the ones it left on the files stay cached for the file tier,
+                // which is what that tier reads during decode and prompts.  MADV_DONTNEED alone only drops the PTEs
+                // of a shared file mapping, so POSIX_FADV_DONTNEED is the call that frees the cache (both, as on the
+                // experts.bin path above).  The page-aligned interior is used so a page shared with a neighbouring
+                // expert that stayed on the file is not evicted.
+                const uint64_t page = (uint64_t) page_size;
+                for (int r = 0; r < 3; ++r) {
+                    const size_t i = (size_t) (3 * layer + r);
+                    const uint64_t per = role_bytes_[i];
+                    if (per == 0) continue;
+                    const size_t f = (size_t) role_file_[i];
+                    const uint8_t* role = role_ptr_[i];
+                    // consecutive kept experts share one call: the complement is ranked, so the runs are short but
+                    // merging still turns most of a layer's 256 experts into a handful of ranges
+                    int64_t run_start = -1;
+                    auto flush_run = [&](int64_t end_expert) {
+                        if (run_start < 0) return;
+                        const uint64_t off = (uint64_t) run_start * per;
+                        const uint64_t len = (uint64_t) (end_expert - run_start) * per;
+                        run_start = -1;
+                        if (len == 0) return;
+                        const uint64_t misalign = ((uintptr_t) (role + (size_t) off)) % page;
+                        const uint64_t skip = misalign == 0 ? 0 : page - misalign;
+                        if (len > skip) {
+                            const uint64_t whole = (len - skip) / page * page;
+                            if (whole != 0)
+                                (void) madvise((void*) (role + (size_t) off + (size_t) skip), (size_t) whole,
+                                               MADV_DONTNEED);
+                        }
+#if !defined(__APPLE__)
+                        if (f < maps_.size() && maps_[f].fd >= 0) {
+                            const uint64_t file_off = (uint64_t) (role - maps_[f].base) + off;
+                            (void) posix_fadvise(maps_[f].fd, (off_t) file_off, (off_t) len, POSIX_FADV_DONTNEED);
+                        }
+#endif
+                    };
+                    for (int64_t expert = 0; expert < n_expert_; ++expert) {
+                        const bool kept = offsets[(size_t) layer * (size_t) n_expert_ + (size_t) expert] != kNoComplement;
+                        if (kept) {
+                            if (run_start < 0) run_start = expert;
+                        } else {
+                            flush_run(expert);
+                        }
+                    }
+                    flush_run(n_expert_);
+                }
             }
 #endif
             const int64_t done = layers_done.fetch_add(1) + 1;

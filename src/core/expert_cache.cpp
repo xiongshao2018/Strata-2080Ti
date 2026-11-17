@@ -1,5 +1,6 @@
 // src/core/expert_cache.cpp - R4's slot storage and residency table.  Read the header first.
 #include "strata/core/expert_cache.hpp"
+#include "strata/core/on_device.hpp"
 
 // #533's segmented cache uses CUDA's virtual memory management (cuMem*): not on HIP, neither the RDNA backend nor
 // the gfx906 compat build (PR #638), which compiles this file as HIP without STRATA_USE_HIP
@@ -35,6 +36,170 @@
 #endif
 
 namespace strata::core {
+
+// ---------------------------------------------------------------------------
+// x1 bypass for the queued cache fill (opt-in: STRATA_X1_BYPASS, default off).
+//
+// The same fork pair as the prompt path's bypass (src/prefill/prefill.cpp): the second card sits behind a root
+// port that negotiates x1 (0.8 GB/s), so `fill_slot_queued`'s host-to-device copy crawls when the slot is on that
+// card - measured 1.83 GiB of refill in 5.16 s, where 1.83 GiB over x16 is 0.15 s.  With the switch on, the bytes
+// go host -> GPU0 over x16 and GPU0 -> the slot over NVLink (`cudaMemcpyPeerAsync`), and the caller's stream waits
+// on the peer copy's event, so the ordering the caller relies on (the queued copy is ordered against its stream's
+// earlier work, and `sync_queued`'s stream wait covers it) is exactly what it was.
+//
+// Several ring buffers and one stream per buffer, because a refill is thousands of independent 4 MB blobs: one
+// buffer would serialise the x16 upload and the NVLink send of every blob against each other.  Unset or 0 keeps
+// the original single `cudaMemcpyAsync` on the legacy stream, byte for byte.
+// ---------------------------------------------------------------------------
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL)
+namespace {
+
+bool x1_bypass_on() {
+    static const bool v = [] {
+        const char* e = std::getenv("STRATA_X1_BYPASS");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    return v;
+}
+
+/// One contiguous run of a blob: `n` bytes at `p`, landing `at` bytes into the slot.
+struct BypassPiece { const uint8_t* p; size_t n; uint64_t at; };
+
+enum class BypassResult { kDirect, kCopied, kFailed };
+
+struct RefillBypass {
+    static constexpr int kRing = 6;
+    struct Ring {
+        cudaStream_t s = nullptr;
+        cudaEvent_t done = nullptr;
+        uint8_t* buf = nullptr;
+        bool used = false;
+    };
+    std::mutex mu;
+    Ring ring[kRing];
+    int next = 0;
+    size_t bytes = 0;      ///< the staging buffer size (every ring slot's)
+    int peer = -1;         ///< the destination device peer access was enabled for
+    bool failed = false;
+    bool warned = false;
+    // No destructor: this outlives main, and a CUDA call after the context is torn down is a crash, not a leak.
+
+    bool ensure(int dev, size_t want, std::string& err) {
+        if (failed) return false;
+        const OnDevice on(0);
+        if (peer != dev) {
+            int can = 0;
+            if (cudaDeviceCanAccessPeer(&can, 0, dev) != cudaSuccess || can == 0) {
+                (void) cudaGetLastError();
+                err = "no peer access from GPU0 to device " + std::to_string(dev);
+                failed = true;
+                return false;
+            }
+            const cudaError_t e = cudaDeviceEnablePeerAccess(dev, 0);
+            if (e != cudaSuccess && e != cudaErrorPeerAccessAlreadyEnabled) {
+                (void) cudaGetLastError();
+                err = std::string("cudaDeviceEnablePeerAccess: ") + cudaGetErrorString(e);
+                failed = true;
+                return false;
+            }
+            (void) cudaGetLastError();
+            peer = dev;
+        }
+        if (bytes >= want && ring[0].buf != nullptr) return true;
+        const size_t have = bytes;
+        for (int i = 0; i < kRing; ++i) {
+            if (ring[i].s == nullptr && cudaStreamCreateWithFlags(&ring[i].s, cudaStreamNonBlocking) != cudaSuccess) {
+                (void) cudaGetLastError();
+                err = "cudaStreamCreate";
+                failed = true;
+                return false;
+            }
+            if (ring[i].done == nullptr && cudaEventCreateWithFlags(&ring[i].done, cudaEventDisableTiming) != cudaSuccess) {
+                (void) cudaGetLastError();
+                err = "cudaEventCreate";
+                failed = true;
+                return false;
+            }
+        }
+        if (have > 0) {   // every stream is idle here: `mu` is held and `sync_queued` drained the ring
+            for (int i = 0; i < kRing; ++i)
+                if (ring[i].buf != nullptr) { cudaFree(ring[i].buf); ring[i].buf = nullptr; }
+            bytes = 0;
+        }
+        for (int i = 0; i < kRing; ++i) {
+            if (cudaMalloc((void**) &ring[i].buf, want) != cudaSuccess) {
+                (void) cudaGetLastError();
+                err = "cudaMalloc of the x1 bypass staging buffer";
+                failed = true;
+                return false;
+            }
+        }
+        bytes = want;
+        return true;
+    }
+};
+
+RefillBypass& refill_bypass() {
+    static RefillBypass v;
+    return v;
+}
+
+/// The pieces into `dst` through GPU0, or `kDirect` when this is not a peer slot (or the bypass cannot run: the
+/// caller's direct copies then write the whole blob, so a half-done bypass copy is not a hazard).
+BypassResult refill_bypass_copy(uint8_t* dst, const BypassPiece* pieces, int n, std::string& err) {
+    if (!x1_bypass_on()) return BypassResult::kDirect;
+    cudaPointerAttributes at{};
+    if (cudaPointerGetAttributes(&at, dst) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return BypassResult::kDirect;
+    }
+    if (at.device <= 0) return BypassResult::kDirect;
+    size_t span = 0;
+    for (int i = 0; i < n; ++i) span = std::max<size_t>(span, (size_t) (pieces[i].at + pieces[i].n));
+    if (span == 0) return BypassResult::kDirect;
+    RefillBypass& x = refill_bypass();
+    std::lock_guard<std::mutex> lock(x.mu);
+    if (!x.ensure(at.device, span + 256, err)) {
+        if (!x.warned) {
+            x.warned = true;
+            std::fprintf(stderr, "strata: x1 bypass (expert cache): %s; refills stay on the direct host-to-device copy\n",
+                         err.c_str());
+        }
+        err.clear();
+        return BypassResult::kDirect;
+    }
+    RefillBypass::Ring& r = x.ring[x.next];
+    x.next = (x.next + 1) % RefillBypass::kRing;
+    {
+        const OnDevice on(0);
+        bool ok = !r.used || cudaStreamWaitEvent(r.s, r.done, 0) == cudaSuccess;
+        for (int i = 0; ok && i < n; ++i)
+            ok = cudaMemcpyAsync(r.buf + pieces[i].at, pieces[i].p, pieces[i].n, cudaMemcpyHostToDevice, r.s) == cudaSuccess;
+        ok = ok && cudaMemcpyPeerAsync(dst, at.device, r.buf, 0, span, r.s) == cudaSuccess &&
+             cudaEventRecord(r.done, r.s) == cudaSuccess;
+        if (!ok) {
+            const cudaError_t e = cudaGetLastError();
+            // whatever did reach the ring stream must finish before the caller's direct copy writes the same bytes
+            (void) cudaStreamSynchronize(r.s);
+            r.used = false;
+            x.warned = true;
+            std::fprintf(stderr, "strata: x1 bypass (expert cache): the two-stage copy failed (%s); that refill takes the "
+                                 "direct host-to-device copy\n", cudaGetErrorString(e));
+            return BypassResult::kDirect;
+        }
+        r.used = true;
+    }
+    // the caller's stream is the one its slot work is ordered on: make it wait for the peer copy that writes the slot
+    if (cudaStreamWaitEvent((cudaStream_t) 0, r.done, 0) != cudaSuccess) {
+        (void) cudaGetLastError();
+        (void) cudaStreamSynchronize(r.s);
+        return BypassResult::kDirect;
+    }
+    return BypassResult::kCopied;
+}
+
+}  // namespace
+#endif
 
 #if defined(STRATA_EC_NVML_FREE)
 namespace {
@@ -845,6 +1010,19 @@ bool ExpertCache::fill_slot_queued(int32_t slot, const uint8_t* host_blob, std::
                              : "ExpertCache::fill_slot_queued: the host blob is null";
         return false;
     }
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL)
+    {
+        const BypassPiece piece{host_blob, n, 0};
+        const BypassResult r = refill_bypass_copy(dst, &piece, 1, err);
+        if (r == BypassResult::kCopied) {
+            ++fills_;
+            return true;
+        }
+        if (!err.empty()) {   // the direct copy below is the fallback, not a second failure
+            err.clear();
+        }
+    }
+#endif
     const cudaError_t e = cudaMemcpyAsync(dst, host_blob, n, cudaMemcpyHostToDevice, (cudaStream_t) 0);
     if (e != cudaSuccess) {
         err = std::string("ExpertCache::fill_slot_queued: ") + cudaGetErrorString(e);
@@ -867,6 +1045,26 @@ bool ExpertCache::fill_slot_queued_parts(int32_t slot, const BlobPart* parts, in
         err = "ExpertCache::fill_slot_queued_parts: the pieces are larger than a slot";
         return false;
     }
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL)
+    {   // only a blob that tiles its slot exactly: the staging ring sends one contiguous run, and the gaps between
+        // pieces would otherwise take whatever the ring's buffer held from an earlier expert
+        bool tiled = n > 0 && parts[0].at == 0;
+        uint64_t end = 0;
+        for (int i = 0; tiled && i < n; ++i) {
+            tiled = parts[i].at == end && parts[i].n > 0;
+            end += parts[i].n;
+        }
+        if (tiled && end == total) {
+            std::vector<BypassPiece> pieces((size_t) n);
+            for (int i = 0; i < n; ++i) pieces[(size_t) i] = BypassPiece{parts[i].p, (size_t) parts[i].n, parts[i].at};
+            if (refill_bypass_copy(dst, pieces.data(), n, err) == BypassResult::kCopied) {
+                ++fills_;
+                return true;
+            }
+            err.clear();
+        }
+    }
+#endif
     for (int i = 0; i < n; ++i) {
         const cudaError_t e = cudaMemcpyAsync(dst + parts[i].at, parts[i].p, (size_t) parts[i].n, cudaMemcpyHostToDevice,
                                               (cudaStream_t) 0);
