@@ -8,6 +8,7 @@ A/B 实测与生产配置。机器：SC117 IQ3_S（IQ3_S experts），GPU1 挂�
 - [AGENT-AB.md](AGENT-AB.md)：多步 agent 场景实测——0.2.17 decode 113.5 vs fork 105.4
   tok/s（+7.7%），TTFT 持平。
 - [PRODUCTION.md](PRODUCTION.md)：当前生产开关、长 prefill 优化结果、WMMA 在 sm75 上崩溃
+- [SAMPLING-CODE-AGENT.md](SAMPLING-CODE-AGENT.md)：采样参数与多步编程 agent——top_p/top_k 在 greedy 下无效、采样慢 10-15%；真正瓶颈是 thinking budget，建议编程请求传 reasoning_budget_tokens=128。
   的禁用记录、短 prefill 固定开销探索与采样配置结论。
 
 ## 补丁要点（engine）
