@@ -42,6 +42,7 @@
 #include "strata/core/pinned_ring.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/core/on_device.hpp"
+#include "strata/core/x1_bypass.hpp"
 #include "strata/core/stream_watch.hpp"
 #include "strata/platform/aux_cpus.hpp"
 
@@ -89,124 +90,9 @@ bool native_expert_i8_floor_gated() noexcept;   // true: the unset int8 default 
 
 namespace {
 // ---------------------------------------------------------------------------
-// x1 bypass (opt-in, default OFF).
-//
-// Two RTX 2080 Ti joined by an NVLink bridge, but the second card sits behind
-// a chipset root port that negotiates x1 (~0.8 GB/s) while the first is x16
-// (~12.4 GB/s).  A streamed expert blob for the second card is normally DMA'd
-// straight from pinned host RAM across that x1 link.  With STRATA_X1_BYPASS=1
-// the same bytes go host -> GPU0 over x16, then GPU0 -> GPU1 over NVLink
-// (cudaMemcpyPeerAsync), and the caller's copy stream waits on the peer copy.
-// Unset or 0 keeps the original single H2D byte-for-byte.
-//
-// One staging buffer and one stream on GPU0.  All callers share one FIFO
-// stream, so one event is enough for the caller's wait.  The peer copy is the
-// operation that actually writes the ring slot, so it must inherit that slot's
-// release event too: a wait on the caller's copy stream cannot stop x.s from
-// overwriting a slot the compute stream is still reading.
+// x1 bypass (opt-in, default OFF): shared with the expert cache's refills.
 // ---------------------------------------------------------------------------
-static bool x1_bypass_on() {
-    static const bool v = [] {
-        const char* e = std::getenv("STRATA_X1_BYPASS");
-        return e != nullptr && std::atoi(e) != 0;
-    }();
-    return v;
-}
-
-struct X1Bypass {
-    std::mutex mu;
-    cudaStream_t s = nullptr;
-    cudaEvent_t ev = nullptr;
-    uint8_t* buf = nullptr;
-    size_t bytes = 0;
-    bool failed = false;
-    bool warned = false;
-    bool peers_tried = false;
-
-    ~X1Bypass() {
-        if (s) cudaStreamDestroy(s);
-        if (ev) cudaEventDestroy(ev);
-        if (buf) cudaFree(buf);
-    }
-    bool ensure(size_t n) {
-        if (failed) return false;
-        if (buf && bytes >= n && s && ev) return true;
-        const strata::core::OnDevice on(0);
-        if (!s && cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) != cudaSuccess) { failed = true; return false; }
-        if (!ev && cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) { failed = true; return false; }
-        if (!peers_tried) {
-            peers_tried = true;
-            int a = 0, b = 0;
-            cudaDeviceCanAccessPeer(&a, 0, 1);
-            if (a) {
-                cudaError_t e0 = cudaDeviceEnablePeerAccess(1, 0);
-                if (e0 == cudaErrorPeerAccessAlreadyEnabled) { cudaGetLastError(); e0 = cudaSuccess; }
-                const strata::core::OnDevice on1(1);
-                cudaError_t e1 = cudaDeviceEnablePeerAccess(0, 0);
-                if (e1 == cudaErrorPeerAccessAlreadyEnabled) { cudaGetLastError(); e1 = cudaSuccess; }
-                b = e0 == cudaSuccess && e1 == cudaSuccess;
-            }
-            if (!a || !b)
-                std::fprintf(stderr, "strata: x1 bypass: GPU0/GPU1 peer access is not available; the two-stage copy may stage through the host\n");
-        }
-        if (buf && bytes < n) {
-            // x.s is non-blocking: cudaFree's implicit sync does not drain
-            // the peer copies queued on it.  Wait before releasing x.buf.
-            if (s) cudaStreamSynchronize(s);
-            cudaFree(buf); buf = nullptr; bytes = 0;
-        }
-        if (!buf) {
-            const size_t want = n + 256;
-            if (cudaMalloc((void**) &buf, want) != cudaSuccess) { buf = nullptr; failed = true; return false; }
-            bytes = want;
-        }
-        return true;
-    }
-};
-
-static X1Bypass& x1_bypass() { static X1Bypass v; return v; }
-
-// Drop-in replacement for
-//   cudaMemcpyAsync(dst, host, n, cudaMemcpyHostToDevice, s)
-// for a streamed expert blob.  Any failure falls back to that exact call.
-static void h2d_expert(uint8_t* dst, const uint8_t* host, size_t n, cudaStream_t s,
-                        cudaEvent_t slot_release = nullptr) {
-    if (!x1_bypass_on()) {
-        cudaMemcpyAsync(dst, host, n, cudaMemcpyHostToDevice, s);
-        return;
-    }
-    cudaPointerAttributes at{};
-    if (cudaPointerGetAttributes(&at, dst) != cudaSuccess || at.device <= 0) {
-        cudaMemcpyAsync(dst, host, n, cudaMemcpyHostToDevice, s);
-        return;
-    }
-    X1Bypass& x = x1_bypass();
-    std::lock_guard<std::mutex> lock(x.mu);
-    if (!x.ensure(n)) {
-        if (!x.warned) {
-            x.warned = true;
-            std::fprintf(stderr, "strata: x1 bypass: GPU0 staging setup failed; falling back to the direct host-to-device copy\n");
-        }
-        cudaMemcpyAsync(dst, host, n, cudaMemcpyHostToDevice, s);
-        return;
-    }
-    {
-        const strata::core::OnDevice on(0);
-        if (cudaMemcpyAsync(x.buf, host, n, cudaMemcpyHostToDevice, x.s) != cudaSuccess ||
-            (slot_release && cudaStreamWaitEvent(x.s, slot_release, 0) != cudaSuccess) ||
-            cudaMemcpyPeerAsync(dst, at.device, x.buf, 0, n, x.s) != cudaSuccess ||
-            cudaEventRecord(x.ev, x.s) != cudaSuccess) {
-            if (!x.warned) {
-                x.warned = true;
-                std::fprintf(stderr, "strata: x1 bypass: the two-stage copy failed; falling back to the direct host-to-device copy\n");
-            }
-            cudaMemcpyAsync(dst, host, n, cudaMemcpyHostToDevice, s);
-            return;
-        }
-    }
-    cudaStreamWaitEvent(s, x.ev, 0);
-}
-// ---------------------------------------------------------------------------
+using strata::core::h2d_expert;
 
 // STRATA_PLE_BATCH for the prompt path: the user's variable wins; unset, it is on except for an engine built with CUDA 12.8 on a compute capability 12.0 card
 // (sm120_series.hpp ple_batch_default), which says so once.
@@ -3701,6 +3587,11 @@ int64_t pipe_floor() {
     }();
     return f;
 }
+// A last chunk this short streams only the experts it routes to, not every expert its stage misses (the same effect
+// #693's stream_all_min() floor guards for the evened-out rule), so its b is nearly free and evening it out adds a whole
+// pass over those experts for a few tokens.  Measured on two RTX 2080 Ti with a 30/18 layer split: a 30-100 token tail
+// read 1-3.5% slower evened out, 180 tokens and up 1-4% faster; below this the plan keeps today's split.
+constexpr int64_t kShortTail = 128;
 }  // namespace
 void Prefill::set_pipe(double value) { g_pipe = value; }
 void Prefill::set_pipe_request(double value) { g_pipe_req = value; }
@@ -3715,23 +3606,23 @@ int64_t Prefill::pipe_key(double value) { return !(value > 0.0) ? -1 : value <= 
 int64_t Prefill::pipeline_chunk(int64_t n, int64_t cap, int stages, double ratio) {
     if (stages < 2 || n <= 0 || cap <= 0) return cap;
     const int64_t r = ratio_tokens(ratio), S1 = stages - 1;
+    const int64_t k_min = (n + cap - 1) / cap;
     if (r == 0) {
         // `--prefill-pipe 1`: STRATA_PREFILL_EQUAL's rule (#693, generate.cpp equal_chunk) - today's chunk count, evened
         // out on the 256-token grid, only when today's last chunk streams every expert anyway (stream_all_min tokens or
         // more): evening a short tail out would add a full pass over the experts (two RTX 4090: 25% slower)
-        const int64_t k = (n + cap - 1) / cap;
-        const int64_t last = n - (k - 1) * cap;
-        if (k <= 1 || last < stream_all_min()) return cap;
-        const int64_t per = (n + k - 1) / k;
+        const int64_t last = n - (k_min - 1) * cap;
+        if (k_min <= 1 || last < stream_all_min()) return cap;
+        const int64_t per = (n + k_min - 1) / k_min;
         return std::min(cap, ((per + 255) / 256) * 256);
     }
+    if (n - (k_min - 1) * cap < kShortTail) return cap;
     auto cost = [&](int64_t c) {   // chunks of c tokens, the last the rest
         const int64_t k = (n + c - 1) / c;
         return k * r + n + S1 * (r + std::min(c, n));
     };
     const int64_t today = std::min(n, cap);
     const int64_t today_cost = cost(today);
-    const int64_t k_min = (n + cap - 1) / cap;
     const int64_t lo = pipe_floor();
     const int64_t k_max = ratio > 0.0 ? std::max<int64_t>(k_min, std::min<int64_t>(64, (n + lo - 1) / lo)) : k_min;
     int64_t best = today;
