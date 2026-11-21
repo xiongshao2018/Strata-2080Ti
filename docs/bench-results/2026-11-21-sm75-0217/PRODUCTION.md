@@ -251,3 +251,40 @@ prefill 均在噪声内（见下表）。回滚备份：
 - 不加 `STRATA_RESIDENT_HEADROOM_GIB`（补集仍是 19.52 GiB，无效）。
 - 不动 `--short-read`（默认 64 是当前最优：90 token 走 batched，15 token 走 windows）。
 - 卡0 不加 `--vram-reserve-mib`，接受 431 MiB 告警。
+
+### A/B：关掉双卡 CPU share —— 明确变差，已回滚
+
+上一版 `PRODUCTION.md` 把 `STRATA_SPLIT_CPU_SHARE=0` 记为“测试被外部负载干扰未能定量”。
+本轮在无外部客户端时补测（同一 `/tmp/incr.py`，20K 上下文）：
+
+| 新增 token | share 开（生产） | share 关 |
+|---:|---:|---:|
+| 20 | 406 ms | 448 ms |
+| 63 | 505 ms | 607 ms |
+| 128 | 580 ms | 700 ms |
+| 256 | 703 ms | 821 ms |
+| 512 | 911 ms | 1032 ms |
+
+share 关掉后短增量**全线慢 10-20%**，且越长越明显。结论：双卡默认开启的 CPU share
+对 agent 前缀复用是净收益，**必须保留**。`env.extra` 已回滚到不含
+`STRATA_SPLIT_CPU_SHARE` / `STRATA_PREFILL_CPU_SHARE` 的状态
+（备份 `env.extra.bak-20261121-1730-nocpushare`）。
+
+### 冷预填吞吐随长度单调上升（20K 是天花板，不是退步）
+
+同一进程、页缓存已热、内容全新（0 reuse）的冷 prompt，本轮实测：
+
+| prompt | tok/s |
+|---:|---:|
+| 20311 | 2008 |
+| 27060 | 2241 |
+| 37186 | 2313 |
+| 54061 | **2413** |
+
+**2300+ 需要 ≥30K**；20K 档约 2000，25K 档约 2200。这与 0.1.43 的“2300+”不矛盾——
+0.1.43 的 2300+ 也是长 prompt 数字。所以“20-30K 冷预填只有 2100”不是退步，
+而是长度本身摊不薄每 chunk 的专家遍历成本（b/a ≈ 5000）。
+
+要再往上抬只能加长 chunk（`--prefill auto:16384`）或提高 pipe 比，
+但 16K chunk 会让借用槽从 3408 涨到约 6800，`--resident-budget-gib 24` 下的
+RAM 副本补集跟不上，反而触发“无 RAM 副本”流式读。**当前 8192 chunk 是最优折中。**
