@@ -512,5 +512,154 @@ decode 掉到 56.0（31）或 61.3（32），76K 预填也掉 1-3%。
 - `--conversation-cache-min-tokens 0`：首步收益不稳定，且短会话快照会挤占
   长会话缓存（实测 evictions=1），不值得。
 
-**生产配置最终**：保持 18:46 基础 + later512 + pf16k + ls30，
+**生产配置最终**：保持 18:46 基础 + later2100（2026-11-22 04:00 恢复，见下节）+ pf16k + ls30，
 `--conversation-cache-min-tokens 2000`、`--short-read` 默认 64 均不变。
+
+## 补充：1500/2100 恢复、短生成固定开销与 16384 复核（2026-11-22）
+
+### 1500/2100 已恢复并确认生效
+
+服务实际启动参数：
+
+```text
+--vram-reserve-mib 1500
+--vram-reserve-later-mib 2100
+--layer-split 30
+--pipeline-windows 2
+--spec 4
+STRATA_PREFILL_AUTO_MAX=16384
+STRATA_SPLIT_SMALL_OWN=512
+```
+
+启动日志同步确认 `prefill plan: chunk 16384`、`lend sizing: ... borrows 5625 slots`
+（4395 个保留 RAM 副本，1230 个无 RAM 副本）、`CUDA1 expert cache 7588 slots`。
+
+空闲时显存：
+
+| 卡 | used | free | 说明 |
+|---|---:|---:|---|
+| CUDA0 | 20657 MiB | 1345 MiB | 启动日志“everything loaded”时为 1534 MiB，差额是引擎后续 cache/graph |
+| CUDA1 | 20089 MiB | 1903 MiB | 启动日志为 2008 MiB |
+
+**1500 MiB 保留已按用户要求恢复并生效**，卡0 的 1345 MiB 不是配置没生效，
+而是引擎在启动后又分配了约 200 MiB 的 cache/verify 缓冲。
+
+### 卡1 让出的空间不能再填到卡0：卡0 已经满了
+
+当前分层：
+
+| 卡 | 负责层 | 专家槽 | profile 覆盖 |
+|---|---|---|---:|
+| CUDA0 | 0-29 | 8702 / 8702（16.09 GiB） | 100% |
+| CUDA1 | 30-47 | 7588 / 9216（15.14 GiB） | 82.3% |
+
+卡0 的 30 层全部 profile 专家已经在显存里，**没有“再塞更多专家到卡0”的空间**。
+卡1 桌面进程合计约 230 MiB（Xorg 105 + awesun 11 + firefox 39 + gnome-shell 7），
+即使全移走也只够约 115 个槽，对 9216 个 profile 对的影响 <1.3%。
+要把卡1 的 1628 个缺口补上只能把层挪给卡0（`--layer-split 31/32`），
+实测 decode 掉到 56.0/61.3、76K 预填掉 1-3%，**明确更差，保持 30**。
+结论：卡0 满载、卡1 是流水线瓶颈（负载时卡0 约 100 W、卡1 约 250-260 W/280 W），
+“把卡1 空闲填到卡0”在 `--layer-split 30` 下没有可行空间。
+
+### 五组单变量 A/B：全部无效或有害，已回滚
+
+基线为同一短步脚本 939-1150 ms：
+
+| 实验 | 短步结果 | 结论 |
+|---|---|---|
+| `STRATA_CKPT_THREADS=1` | 1128-1273 ms，32tok 83.8 vs 95.4 | 无效，回滚 |
+| `--pipeline-windows 0` | 1164-1326 ms | 更差，回滚为 2 |
+| `STRATA_MTP_STAGE0=1` | 1244-1407 ms，32tok 77.1 | 更差，回滚 |
+| `STRATA_CKPT_POOL=1` | 1099-1270 ms | 无效，回滚 |
+| `--spec 6` | 512tok 86.1 vs 135.0 | 明显更差，回滚为 4 |
+
+注意：源码注释称“两阶段且卡0 无 draft 层时 `--pipeline-windows 2` 会输给串行循环”，
+但本机 `pw=0` 与 `MTP_STAGE0=1` 都实测更慢，**本机结论与注释相反，保持 pw=2**。
+
+### trace 分解：refill 已双卡并行，checkpoint 是固定成本
+
+`STRATA_TRACE` 关键片段：
+
+```text
+27K: read 27031 tokens (batched) 11579.6 ms; refilled 4920 slots on 2 stage(s) in 1002.4 ms
+36K: refilled 4920 slots on 2 stage(s) in 1036.3 ms
+9K : read 9031 tokens (batched) 5043.7 ms; refilled 2938 slots in 577.0 ms; tail read 4 tokens 148.8 ms
+```
+
+refill 只占 27K/36K 的 7-9%，且 `generate.cpp` 已实现“各 stage 先 `refill_issue`
+全部发出，再 `refill_wait`”的双卡并行（约 19650 行），**没有进一步并行空间**；
+`STRATA_REFILL_SERIAL` 只会更慢。
+
+短增量（76K 上下文）：
+
+```text
+266 token: read 266 tokens (batched) 1110 ms + checkpoint save 83.5 ms + tail 4 tokens 35.8 ms = 1335 ms
+ 61 token: read 56 tokens (windows) 442 ms + checkpoint save 84.2 ms + tail 4 tokens 38.1 ms = 669 ms
+```
+
+checkpoint 固定 83-90 ms/请求，但 `CKPT_THREADS` 与 `CKPT_POOL` 都实测无收益。
+**剩余成本主要是长上下文下的注意力/窗口计算，不是配置退化。**
+
+### 最终验证（1500/2100 生产配置，2026-11-22 04:00）
+
+冷预填：
+
+| prompt | tok/s |
+|---:|---:|
+| 9036 | 1550.8 |
+| 27036 | 2105.7 |
+| 36035 | 2237.6 |
+| 76039 | **2586.3** |
+
+76K 建会话 2573.6 tok/s；76K decode `gen=101` **67.1 tok/s**，命中率 93.8%。
+
+生成长度曲线：
+
+| gen | 32 | 64 | 128 | 256 | 512 |
+|---|---:|---:|---:|---:|---:|
+| tok/s | 93.2 | 88.3 | 83.4 | 120.0 | 105.4 |
+
+多步短会话（`/tmp/shortagent.py`，32 tok/步）：
+
+```text
+trial0 [2987, 1003, 1069, 1087, 1115]
+trial1 [2548, 1942, 5374, 1137, 1152]
+trial2 [2621, 1032, 1130, 1065, 1148]
+```
+
+首步 2.5-3.0 s 是冷读；稳定后 1003-1152 ms，`read=266` 约 680 ms。
+76K 小增量：46 tok 452 ms、61 tok 496 ms、108 tok 1013 ms、172 tok 1075 ms、271 tok 1204 ms。
+
+### 全量日志版本对比：没有退步
+
+`/tmp/ver.py` 按 `session is up (engine X)` 切分 9524 个请求：
+
+| 版本 | decode p50 (gen>=64) | 长 prefill 分档 |
+|---|---:|---|
+| 0.1.56 | 88.6（n=6665） | 8-16K 1217、16-32K 1402、32-64K 1955、64K+ 2058 |
+| 0.1.63 | **89.0**（n=766） | 8-16K 1455、16-32K 1982、32-64K 2179、64K+ 2452 |
+
+decode 持平；长 prefill 0.1.63 在各长度档全面更快（8-16K 的 1455 vs 1217
+是样本结构不同，0.1.63 该档 307 条、0.1.56 仅 9 条）。
+**“最新日志明显退步”在数据上不成立，用户感受来自短生成的绝对延迟。**
+
+### 环境事实：主机内存比显存更紧张
+
+```text
+Mem 62 GiB total / 47 GiB used / 15 GiB available
+Swap 8 GiB / 7.9 GiB used        ← swap 基本全满
+strata-host RSS 50 GiB：32 GiB 是 /dev/zero 共享映射（常驻专家），16 GiB 是 GGUF 文件映射
+```
+
+swap 主要被浏览器/java/node 等其它进程占用，`strata-host` 自身 `VmSwap=0`。
+因此**不要为了短步延迟盲目调大 `--conversation-cache-mib` 或 RAM 副本预算**，
+否则有 OOM 风险。
+
+### 本轮结论
+
+- 1500/2100 已恢复并生效，卡0 空闲 1345 MiB、卡1 1903 MiB。
+- 五组候选（CKPT_THREADS / pw=0 / MTP_STAGE0 / CKPT_POOL / spec=6）全部实测无效或有害，已回滚，无残留。
+- 长 prefill 已回到历史最优：76K 2586.3 tok/s，与历史 2586 持平。
+- 多步 agent 慢的真因是长上下文下的短生成固定成本（每步约 400-500 ms 读 + 84 ms checkpoint + 窗口计算），不是版本退化。
+- 卡0 在 `--layer-split 30` 下 8702/8702 已满载；把层挪到卡0 会让 decode 掉到 56-61 tok/s，不动。
+- 后续若要把多步 decode 再压下去，方向应是减少每步窗口 miss（提高长上下文专家命中率），而不是继续调 chunk/pipeline 参数。
