@@ -475,3 +475,38 @@ decode 掉到 56.0（31）或 61.3（32），76K 预填也掉 1-3%。
 3. **小 prompt 弱档仍在**：9K 1524 tok/s 是单 chunk 无流水重叠的物理结果，
    `pipe=1700` 反而更差，没有便宜的解法。
 4. **上下文上限**：262144 是硬上限，3×18K 轮次即触顶返回 400，需客户端自己裁剪。
+
+## 关键修复：短会话 agent 的 `min-tokens 2000` 门槛（2026-11-22）
+
+用户反馈“agent 多步场景慢于 1500 ms”属实。根因**不是引擎退化，也不是
+`short_read`/`pipeline-windows`/`layer-split`，而是 18:46 配置引入的
+`--conversation-cache-min-tokens 2000`**：1.4-1.7K 的短会话被会话缓存排除，
+日志反复出现 `skip parking (1826 tokens, below the 2000 minimum)`，
+每一步都 `reused=0` 全量冷读，单步 1.5-1.9 s。
+
+历史 0.1.56/0.1.63 稳定期没有这个参数（默认 0 = park any），
+11-21 22:51 启动的短会话 `reused=0` 比例高达 100%，正是门槛造成。
+
+改为 `--conversation-cache-min-tokens 0` 后的 5 步短会话 A/B（3 次 trial）：
+
+| 配置 | 第 1 步 | 第 2-5 步 | `reused` |
+|---|---:|---:|---:|
+| 2000（旧） | 2632-2841 ms | 1089-1247 ms | 前 1 步 0，后续约 2500 |
+| **0（现）** | **779-931 ms** | **1025-1194 ms** | 第 2 步起 2531 |
+
+首步冷读降低 65%，多步 agent 不再出现 >1500 ms 的 prefilling；
+长会话续写未退化（76K read=271 从 1244 → 1237 ms），
+76K decode 66.9 tok/s（此前 62.1），冷预填 2608 tok/s（噪声内）。
+
+08:54 最终状态：`--conversation-cache-min-tokens 0` 已写入生产 JSON。
+
+否决的候选（均实测无效或有害，**不要再加**）：
+
+- `--short-read 256` / `512`：read=172 从 1151 ms 涨到 1566/1600 ms，
+  read=271 从 1244 ms 涨到 1290/2554 ms。窗口路径覆盖过长会拖慢。
+- 运行时 `STRATA_PIPELINE_SWITCH=pw=0`：read=61 从 ~560 ms 涨到 790 ms。
+- `--conversation-cache-slots 1`：对受控短会话无改善（read=61 反而 634 vs 560 ms）。
+
+**生产配置最新差异**：仅把 `--conversation-cache-min-tokens 2000` 改为 `0`；
+其余保持 `--vram-reserve-later-mib 512`、`STRATA_PREFILL_AUTO_MAX=16384`、
+`--layer-split 30`、`--prefill-pipe 5000`、`--short-read` 默认。
