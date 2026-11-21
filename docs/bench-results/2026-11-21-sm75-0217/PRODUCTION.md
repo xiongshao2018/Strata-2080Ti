@@ -172,3 +172,82 @@ systemctl --user restart strata.service && ~/.local/share/strata/warmup.sh
 decode 400@20K = 103.8 / 119.8 / 108.9 tok/s，与交接基线一致。
 全历史 decode 分档 p50：0-12K 89.0、12-24K 99.2、24-40K 90.2、40-60K 88.4、
 60-90K 86.9、90-300K 84.1 tok/s（n=4827），长上下文衰减平缓，无断崖。
+
+## 补充：`--vram-reserve-later-mib 640` 与短增量固定开销（2026-11-21 17:18-18:10 实测）
+
+### 卡1 保留空间能不能换成专家槽：能，但换不来空闲显存
+
+`--vram-reserve-later-mib` 只控制**启动后留给其它程序**的保留量，缓存会立刻把让出的
+空间吃掉。A/B（其余参数不动）：
+
+| 值 | CUDA1 专家槽 | CUDA1 空闲显存 |
+|---:|---:|---:|
+| 1100（原） | 8134 | 912 MiB |
+| 640（本次） | **8360（+226）** | **584 MiB** |
+
+结论：**卡1 空闲显存不会因为调低保留而变大**——省下的 460 MiB 被 `expert cache`
+当场转成 226 个槽。想“把卡1 空闲填满”在架构上做不到，除非把槽数上限再抬高，
+而那会让卡1 与卡0 的缓存不对称、并把风险压到 512 MiB 驱动阈值以下。
+卡1 桌面进程实测只占 162 MiB（Xorg 105 / gnome-shell 7 / awesun 11 / firefox 39），
+不是桌面吃掉 1042 MiB。
+
+保留 `640` 的理由是收益为正、风险可接受：短增量 486 → 479 ms，decode 与
+prefill 均在噪声内（见下表）。回滚备份：
+`install/strata-sc117-iq3_s.json.bak-20261121-1800-later1100`。
+
+### 卡0 的 431 MiB 告警不是“没利用满”
+
+日志 “432 MiB of the card's memory are free … Below 512 MiB the driver can move GPU …”
+说的是**驱动在 512 MiB 以下会搬页**，属于性能提示而非可分配余量。卡0 的
+431 MiB 已被 `expert cache` 9178 槽（16.99 GiB）+ MTP 837 MiB + pipeline 窗口占满，
+再抬只会把驱动逼进搬页路径。日志自身建议“decode 正常时什么都不用做”，维持现状。
+
+### 短增量真正的成本：不是退步，是 batched 路径的固定开销
+
+同一会话连续追加（`/tmp/incr.py`，20K 上下文，`max_tokens=1`，greedy）：
+
+| 新增 token | read | wall |
+|---:|---:|---:|
+| 20 | 48 | 406 ms |
+| 63 | 96 | 505 ms |
+| 128 | 168 | 580 ms |
+| 256 | 310 | 703 ms |
+| 512 | 601 | 911 ms |
+
+拟合：**约 370 ms 固定 + 1.06 ms/token**。固定部分与增量大小无关，
+在 65-128 档就是 `PRODUCTION.md` 早先记录的 ~400 ms（290 ms 读 + 84 ms checkpoint
++ 30 ms windows）。低于 `--short-read 64` 的尾巴走 verify window，15 token 只需 246 ms。
+
+对照历史按“读取 token 分档”的 p50（同一日志 7918 请求）：
+
+| read token | 11-20 | 11-21 | 变化 |
+|---:|---:|---:|---|
+| 0-32 | 281 ms | 319 ms | +14% |
+| 32-64 | 413 ms | 560 ms | +36% |
+| 64-128 | **1636 ms** | **533 ms** | **-67%** |
+| 128-256 | 2171 ms | 1052 ms | -52% |
+| 256-600 | 2511 ms | 1449 ms | -42% |
+| 600-2k | 3191 ms | 3077 ms | -4% |
+| 2k+ | 23732 ms | 6754 ms | -72% |
+
+`2k+` 档的 23732 → 6754 主要是 11-20 那天混入了大量冷缓存请求，不能直接当性能提升；
+但 64-600 三档是**实打实的改善**（`STRATA_SPLIT_SMALL_OWN=512` 免掉 lend/stream/refill），
+所以“最新日志明显退步”在数据上不成立。
+
+### 仍然存在的三个痛点（按性价比排序）
+
+1. **321 个借用槽没有 RAM 副本**：每个 chunk 多读约 0.83 GB。与 `SMALL_OWN`、
+   `--resident-headroom-gib` 都无关，补集被 `choose_resident_keep_from` 卡在 19.07 GiB。
+2. **双卡下 SSD 溢出层被静默禁用**：`generate.cpp:13500` 的条件是
+   `conversations.enabled() && stages.empty()`，分层双卡 `stages` 非空 → 永不启用，
+   日志无任何提示；多会话切换的 evictions 是硬丢。
+3. **重启后首个请求冷读约 15 秒**：`expert_source.cpp:4144 drop_file_cache()`
+   在页锁定补集前丢整份页缓存。已用 `warmup.sh` 规避。
+
+### 本轮配置结论
+
+- 保留 `--vram-reserve-later-mib 640`（+226 槽，短增量 -7 ms）。
+- 保留 `STRATA_SPLIT_SMALL_OWN=512`（去掉后短增量 611/609/606 ms，退化 25%）。
+- 不加 `STRATA_RESIDENT_HEADROOM_GIB`（补集仍是 19.52 GiB，无效）。
+- 不动 `--short-read`（默认 64 是当前最优：90 token 走 batched，15 token 走 windows）。
+- 卡0 不加 `--vram-reserve-mib`，接受 431 MiB 告警。
