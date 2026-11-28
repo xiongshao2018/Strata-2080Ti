@@ -41,6 +41,7 @@
 #include "strata/core/pinned_ring.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/core/on_device.hpp"
+#include "strata/core/x1_bypass.hpp"
 #include "strata/core/stream_watch.hpp"
 #include "strata/platform/aux_cpus.hpp"
 
@@ -89,6 +90,9 @@ bool native_expert_i8_floor_gated() noexcept;   // true: the unset int8 default 
 }  // namespace strata::kernels
 
 namespace {
+// x1 bypass (opt-in, default OFF): shared with the expert cache's refills.
+using strata::core::h2d_expert;
+
 // STRATA_PLE_BATCH for the prompt path: the user's variable wins; unset, it is on except for an engine built with CUDA 12.8 on a compute capability 12.0 card
 // (sm120_series.hpp ple_batch_default), which says so once.
 bool ple_batch_enabled() {
@@ -3633,6 +3637,11 @@ int64_t pipe_floor() {
     }();
     return f;
 }
+// A last chunk this short streams only the experts it routes to, not every expert its stage misses (the same effect
+// #693's stream_all_min() floor guards for the evened-out rule), so its b is nearly free and evening it out adds a whole
+// pass over those experts for a few tokens.  Measured on two RTX 2080 Ti with a 30/18 layer split: a 30-100 token tail
+// read 1-3.5% slower evened out, 180 tokens and up 1-4% faster; below this the plan keeps today's split.
+constexpr int64_t kShortTail = 128;
 }  // namespace
 void Prefill::set_pipe(double value) { g_pipe = value; }
 void Prefill::set_pipe_request(double value) { g_pipe_req = value; }
@@ -3647,14 +3656,15 @@ int64_t Prefill::pipe_key(double value) { return !(value > 0.0) ? -1 : value <= 
 int64_t Prefill::pipeline_chunk(int64_t n, int64_t cap, int stages, double ratio) {
     if (stages < 2 || n <= 0 || cap <= 0) return cap;
     const int64_t r = ratio_tokens(ratio), S1 = stages - 1;
+    const int64_t k_min = (n + cap - 1) / cap;
+    if (n - (k_min - 1) * cap < kShortTail) return cap;
     if (r == 0) {
         // `--prefill-pipe 1`: STRATA_PREFILL_EQUAL's rule (#693, generate.cpp equal_chunk) - today's chunk count, evened
         // out on the 256-token grid, only when today's last chunk streams every expert anyway (stream_all_min tokens or
         // more): evening a short tail out would add a full pass over the experts (two RTX 4090: 25% slower)
-        const int64_t k = (n + cap - 1) / cap;
-        const int64_t last = n - (k - 1) * cap;
-        if (k <= 1 || last < stream_all_min()) return cap;
-        const int64_t per = (n + k - 1) / k;
+        const int64_t last = n - (k_min - 1) * cap;
+        if (k_min <= 1 || last < stream_all_min()) return cap;
+        const int64_t per = (n + k_min - 1) / k_min;
         return std::min(cap, ((per + 255) / 256) * 256);
     }
     auto cost = [&](int64_t c) {   // chunks of c tokens, the last the rest
@@ -3663,7 +3673,6 @@ int64_t Prefill::pipeline_chunk(int64_t n, int64_t cap, int stages, double ratio
     };
     const int64_t today = std::min(n, cap);
     const int64_t today_cost = cost(today);
-    const int64_t k_min = (n + cap - 1) / cap;
     const int64_t lo = pipe_floor();
     const int64_t k_max = ratio > 0.0 ? std::max<int64_t>(k_min, std::min<int64_t>(64, (n + lo - 1) / lo)) : k_min;
     int64_t best = today;
@@ -4736,11 +4745,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 const size_t bytes = (size_t) lay0.blob_bytes(en.l);
                 if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
                 if (en.job < 0) {
-                    cudaMemcpyAsync(m.stage_dev[sl], en.blob, bytes, cudaMemcpyHostToDevice, m.copy);
+                    h2d_expert(m.stage_dev[sl], en.blob, bytes, m.copy, m.stage_live[sl] ? m.used[m.used_of[sl]] : nullptr);
                     ++stats_.experts_dma;
                 } else {
                     const uint8_t* hb = m.stager->wait(en.job);
-                    cudaMemcpyAsync(m.stage_dev[sl], hb, bytes, cudaMemcpyHostToDevice, m.copy);
+                    h2d_expert(m.stage_dev[sl], hb, bytes, m.copy, m.stage_live[sl] ? m.used[m.used_of[sl]] : nullptr);
                     m.stager->issued_one(en.job, m.copy);
                 }
                 cudaEventRecord(m.copied[sl], m.copy);
@@ -4844,11 +4853,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const size_t bytes = (size_t) lay0.blob_bytes(en.l);
                             if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
                             if (en.job < 0) {
-                                cudaMemcpyAsync(m.stage_dev[sl], en.blob, bytes, cudaMemcpyHostToDevice, m.copy);
+                                h2d_expert(m.stage_dev[sl], en.blob, bytes, m.copy, m.stage_live[sl] ? m.used[m.used_of[sl]] : nullptr);
                                 ++iss_dma;
                             } else {
                                 const uint8_t* hb = m.stager->wait(en.job);
-                                cudaMemcpyAsync(m.stage_dev[sl], hb, bytes, cudaMemcpyHostToDevice, m.copy);
+                                h2d_expert(m.stage_dev[sl], hb, bytes, m.copy, m.stage_live[sl] ? m.used[m.used_of[sl]] : nullptr);
                                 m.stager->issued_one(en.job, m.copy);
                             }
                             cudaEventRecord(m.copied[sl], m.copy);
@@ -4898,12 +4907,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         prev_rel = -1;
                     }
                     if (en.job < 0) {
-                        cudaMemcpyAsync(m.stage_dev[sl], en.blob, bytes, cudaMemcpyHostToDevice, m.copy);
+                        h2d_expert(m.stage_dev[sl], en.blob, bytes, m.copy, m.stage_live[sl] ? m.used[m.used_of[sl]] : nullptr);
                         ++iss_dma;
                     } else {
                         cover(idx);   // the stager may make the issuer wait
                         const uint8_t* hb = m.stager->wait(en.job);
-                        cudaMemcpyAsync(m.stage_dev[sl], hb, bytes, cudaMemcpyHostToDevice, m.copy);
+                        h2d_expert(m.stage_dev[sl], hb, bytes, m.copy, m.stage_live[sl] ? m.used[m.used_of[sl]] : nullptr);
                         m.stager->issued_one(en.job, m.copy);
                     }
                     if (!sparse_copied) cudaEventRecord(m.copied[sl], m.copy);
@@ -7064,13 +7073,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             if (pinned) {
                                 // DMA straight from the page-locked arena: the copy stream only waits for the slot
                                 if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
-                                cudaMemcpyAsync(m.stage_dev[sl], b, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, m.copy);
+                                h2d_expert(m.stage_dev[sl], b, (size_t) lay.blob_bytes(l), m.copy, m.stage_live[sl] ? m.used[m.used_of[sl]] : nullptr);
                                 ++stats_.experts_dma;
                             } else {
                                 // copied to a pinned buffer by the stager (waits only if it is behind), then DMA
                                 const uint8_t* hb = m.stager->wait(job_of[j]);
                                 if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
-                                cudaMemcpyAsync(m.stage_dev[sl], hb, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, m.copy);
+                                h2d_expert(m.stage_dev[sl], hb, (size_t) lay.blob_bytes(l), m.copy, m.stage_live[sl] ? m.used[m.used_of[sl]] : nullptr);
                                 m.stager->issued_one(job_of[j], m.copy);
                             }
                             cudaEventRecord(m.copied[sl], m.copy);
@@ -8810,12 +8819,12 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
             if (pinned && !b) { err = "prefill (layer-major): expert source has no blob"; return false; }
             if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
             if (pinned) {
-                cudaMemcpyAsync(m.stage_dev[sl], b, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, m.copy);
+                h2d_expert(m.stage_dev[sl], b, (size_t) lay.blob_bytes(l), m.copy, m.stage_live[sl] ? m.used[m.used_of[sl]] : nullptr);
                 ++stats_.experts_dma;
             } else {
                 m.stager->pass(job_of[u]);   // the prefetched jobs below it the routing skipped get no DMA
                 const uint8_t* hb = m.stager->wait(job_of[u]);
-                cudaMemcpyAsync(m.stage_dev[sl], hb, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, m.copy);
+                h2d_expert(m.stage_dev[sl], hb, (size_t) lay.blob_bytes(l), m.copy, m.stage_live[sl] ? m.used[m.used_of[sl]] : nullptr);
                 m.stager->issued_one(job_of[u], m.copy);
             }
             cudaEventRecord(m.copied[sl], m.copy);

@@ -1,6 +1,7 @@
 // src/core/expert_cache.cpp - R4's slot storage and residency table.  Read the header first.
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_cache_refuse.hpp"
+#include "strata/core/x1_bypass.hpp"
 
 // #533's segmented cache uses CUDA's virtual memory management (cuMem*): not on HIP, neither the RDNA backend nor
 // the gfx906 compat build (PR #638), which compiles this file as HIP without STRATA_USE_HIP
@@ -907,7 +908,9 @@ bool ExpertCache::fill_slot_queued(int32_t slot, const uint8_t* host_blob, std::
                              : "ExpertCache::fill_slot_queued: the host blob is null";
         return false;
     }
-    cudaError_t e = cudaMemcpyAsync(dst, host_blob, n, cudaMemcpyHostToDevice, (cudaStream_t) 0);
+    // A slot on GPU1 is normally filled straight from host RAM, which on this machine crosses a PCIe x1 root port.
+    // STRATA_X1_BYPASS stages the blob through GPU0 and peers it over NVLink; every other case is the same call.
+    cudaError_t e = h2d_expert(dst, host_blob, n, (cudaStream_t) 0);
     if (e == cudaSuccess && n < cap) {
         e = cudaMemsetAsync(dst + n, 0, std::min<size_t>(512, cap - n), (cudaStream_t) 0);
     }
@@ -937,8 +940,7 @@ bool ExpertCache::fill_slot_queued_parts(int32_t slot, const BlobPart* parts, in
         return false;
     }
     for (int i = 0; i < n; ++i) {
-        const cudaError_t e = cudaMemcpyAsync(dst + parts[i].at, parts[i].p, (size_t) parts[i].n, cudaMemcpyHostToDevice,
-                                              (cudaStream_t) 0);
+        const cudaError_t e = h2d_expert(dst + parts[i].at, parts[i].p, (size_t) parts[i].n, (cudaStream_t) 0);
         if (e != cudaSuccess) {
             err = std::string("ExpertCache::fill_slot_queued_parts: ") + cudaGetErrorString(e);
             return false;
